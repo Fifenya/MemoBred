@@ -1,0 +1,22 @@
+{
+  "name": "memobred",
+  "version": "0.1.0",
+  "description": "МемоБред — вечериночная игра: собери свой бред из мемов",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "seed": "node server/seed.js --force",
+    "backup": "bash scripts/backup.sh"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "license": "MIT",
+  "private": true
+}
