@@ -1,6 +1,6 @@
 /* ============================================================
    МемоБред — клиент v0.2
-   + Аккаунты, профиль, рейтинг со свайпом, эмбиент-плейлист
+   + Плееры, точечное обновление таймера и прогресса
    ============================================================ */
 
 const socket = io({
@@ -150,13 +150,54 @@ function resetGameState() {
 function isMe(player) { return player?.token && player.token === S.myToken; }
 
 function stopTimer() { if (timerInterval) { clearInterval(timerInterval); timerInterval = null; } }
+
 function runTimer() {
   stopTimer();
   timerInterval = setInterval(() => {
     if (!S.timerEnd) return;
     S.timerRemaining = Math.max(0, S.timerEnd - Date.now());
-    if (S.room) render();
+    updateTimerUI();       // ← точечно, без render()
   }, 500);
+}
+
+// ============================================================
+// Точечные обновления DOM (без перерисовки всего экрана)
+// ============================================================
+
+function updateTimerUI() {
+  const slot = document.getElementById('timer-slot');
+  if (!slot) return;
+
+  let html = '';
+  if (S.timerEnd && S.timerRemaining > 0) {
+    const sec = Math.ceil(S.timerRemaining / 1000);
+    const cls = sec <= 5 ? 'timer urgent' : 'timer';
+    html = `<div class="${cls}">⏱ ${sec}</div>`;
+  }
+
+  if (slot.innerHTML !== html) {
+    slot.innerHTML = html;
+  }
+}
+
+function updateProgressUI() {
+  if (!S.progress) return;
+  const { submitted, expected } = S.progress;
+
+  const fill = document.querySelector('.progress-bar-fill');
+  if (fill) {
+    const pct = expected ? Math.round((submitted / expected) * 100) : 0;
+    fill.style.width = `${pct}%`;
+  }
+
+  document.querySelectorAll('.counter').forEach(el => {
+    const t = el.textContent.trim();
+    if (t.startsWith('Ждём остальных')) {
+      el.textContent = `Ждём остальных: ${submitted} / ${expected}`;
+    } else if (/^\d+\s*\/\s*\d+$/.test(t)) {
+      el.textContent = `${submitted} / ${expected}`;
+    }
+  });
 }
 
 // ============================================================
@@ -204,31 +245,25 @@ const ambient = {
   },
 
   async start() {
-  if (!Settings.ambientOn) {
-    console.log('[ambient] выключен в настройках');
-    return;
-  }
-  if (this.starting) return;
-  if (!this.playlist.length) {
-    console.log('[ambient] плейлист пуст, жду загрузки');
-    return;
-  }
+    if (!Settings.ambientOn) return;
+    if (this.starting) return;
+    if (!this.playlist.length) return;
 
-  this.starting = true;
-  this.init();
+    this.starting = true;
+    this.init();
 
-  try {
-    if (this.el && this.el.paused) {
-      await this.el.play();
-      console.log('[ambient] заиграл:', this.el.dataset.trackId);
+    try {
+      if (this.el && this.el.paused) {
+        await this.el.play();
+        console.log('[ambient] заиграл:', this.el.dataset.trackId);
+      }
+      this.fadeTo(Settings.ambientVolume, 1500);
+    } catch (e) {
+      console.warn('[ambient] play failed:', e.message);
+    } finally {
+      this.starting = false;
     }
-    this.fadeTo(Settings.ambientVolume, 1500);
-  } catch (e) {
-    console.warn('[ambient] play failed:', e.message);
-  } finally {
-    this.starting = false;
-  }
-},
+  },
 
   stop() {
     if (!this.el) return;
@@ -267,17 +302,12 @@ const ambient = {
   setEnabled(on) { on ? this.start() : this.stop(); },
 };
 
-// Пользователь сделал жест — можно играть звук
 let userInteracted = false;
-
 function markUserInteracted() {
   if (userInteracted) return;
   userInteracted = true;
-  // Если плейлист ещё не загружен — start() сам ничего не сделает,
-  // но флаг останется, и мы запустим после загрузки.
   if (Settings.ambientOn) ambient.start();
 }
-
 ['click', 'touchstart', 'keydown'].forEach(ev =>
   document.addEventListener(ev, markUserInteracted, { once: true, passive: true })
 );
@@ -354,10 +384,7 @@ function showToast(text) {
   render();
 }
 
-function setAuthError(msg) {
-  S.authError = msg;
-  render();
-}
+function setAuthError(msg) { S.authError = msg; render(); }
 
 function formatDate(unixSec) {
   const d = new Date(unixSec * 1000);
@@ -482,17 +509,19 @@ socket.on('submissions', (data) => {
   render();
 });
 
+// Прогресс отправок — точечно, без перерисовки (чтобы не сбрасывать скролл)
 socket.on('score_update', (data) => {
   if (data.type === 'submission_progress') {
     S.progress = { submitted: data.submitted, expected: data.expected };
+    updateProgressUI();
   }
-  render();
 });
 
+// Тик таймера — точечно
 socket.on('timer_tick', ({ remaining }) => {
   S.timerRemaining = remaining;
   S.timerEnd = Date.now() + remaining;
-  render();
+  updateTimerUI();
 });
 
 socket.on('reveal', (data) => { S.reveal = data; if (data.prompt) S.prompt = data.prompt; render(); });
@@ -622,7 +651,38 @@ function toggleMeme(memeId) {
   if (idx >= 0) S.selected.splice(idx, 1);
   else if (S.selected.length < 2) S.selected.push(memeId);
   else showToast('Максимум 2 мема');
-  render();
+
+  // Точечное обновление: переключаем класс и текст, не пересоздаём DOM
+  updateHandUI();
+}
+
+// Точечное обновление руки (без перерисовки экрана — сохраняет скролл)
+function updateHandUI() {
+  const rows = document.querySelectorAll('.meme-row');
+  if (!rows.length) return;
+
+  S.hand.forEach((m, i) => {
+    const row = rows[i];
+    if (!row) return;
+    if (S.selected.includes(m.id)) row.classList.add('selected');
+    else row.classList.remove('selected');
+  });
+
+  const need = 2 - S.selected.length;
+  const ready = S.selected.length === 2;
+
+  document.querySelectorAll('.counter').forEach(el => {
+    const t = el.textContent.trim();
+    if (t.startsWith('Выбери ещё') || t.startsWith('Готово')) {
+      el.textContent = ready ? 'Готово — отправляй' : `Выбери ещё ${need}`;
+      el.classList.toggle('ready', ready);
+    }
+  });
+
+  const submit = document.querySelector('button.primary');
+  if (submit && submit.textContent.includes('Отправить')) {
+    submit.disabled = !ready;
+  }
 }
 
 function submitCombo() {
@@ -802,6 +862,9 @@ function updateSettingsButton() {
 // ============================================================
 
 function render() {
+  // Таймер обновим асинхронно — после того, как внутренний рендер установит DOM
+  queueMicrotask(updateTimerUI);
+
   updateSettingsButton();
 
   if (!S.connected) {
@@ -849,11 +912,28 @@ function render() {
   }
 }
 
+// Возвращает только пустой слот. Наполняется через updateTimerUI().
 function timerBadge() {
-  if (!S.timerEnd || S.timerRemaining <= 0) return '';
-  const sec = Math.ceil(S.timerRemaining / 1000);
-  const cls = sec <= 5 ? 'timer urgent' : 'timer';
-  return `<div class="${cls}">⏱ ${sec}</div>`;
+  return `<div id="timer-slot" class="timer-slot"></div>`;
+}
+
+// --- Плеер-«walkman» ---
+function deckFront(memes, { playing = false, clickable = false, onClickJs = '', playBtnJs = '', playBtnInner = null } = {}) {
+  const tapeLines = (memes ?? []).map(m => `<div class="tape-line">${escapeHtml(m.title)}</div>`).join('');
+  const playInner = playBtnInner !== null ? playBtnInner : (playing ? '⏸' : '▶');
+  const playBtnAttr = playBtnJs ? `onclick='event.stopPropagation(); ${playBtnJs}'` : '';
+  return `
+    <div class="deck-face deck-front" ${clickable ? `onclick='${onClickJs}'` : ''}>
+      <div class="deck-window">
+        <div class="deck-reels"><span class="reel"></span><span class="reel"></span></div>
+        <div class="deck-tape">${tapeLines}</div>
+      </div>
+      <div class="deck-controls">
+        <button class="deck-play" ${playBtnAttr} aria-label="Прослушать">${playInner}</button>
+        <span class="deck-dots"><span></span><span></span><span></span></span>
+      </div>
+    </div>
+  `;
 }
 
 // ---------- Welcome ----------
@@ -885,8 +965,7 @@ function renderAuth() {
       <h2 style="margin-bottom: 6px">${isLogin ? 'Вход' : 'Регистрация'}</h2>
 
       <div class="card">
-        <input id="auth-username" placeholder="Имя" maxlength="20"
-               autocomplete="off" />
+        <input id="auth-username" placeholder="Имя" maxlength="20" autocomplete="off" />
         <input id="auth-password" type="password" placeholder="Пароль"
                autocomplete="current-password" />
         ${S.authError ? `<div class="error">${escapeHtml(S.authError)}</div>` : ''}
@@ -1179,7 +1258,7 @@ function renderPlayersSubmit() {
         ${timerBadge()}
         <h2>Ты — судья</h2>
         <div class="prompt-display">${escapeHtml(S.prompt?.text || '')}</div>
-        <p class="subtitle">Ждём комбо от игроков…</p>
+        <p class="subtitle">Ждём плееры от игроков…</p>
         <div class="progress-bar"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
         <p class="counter">${sub} / ${exp}</p>
       </div>
@@ -1197,10 +1276,17 @@ function renderPlayersSubmit() {
         ${timerBadge()}
         <div class="prompt-display">${escapeHtml(S.prompt?.text || '')}</div>
         <h2 style="color: var(--accent); margin-top: 8px">✓ Отправлено</h2>
-        <p class="subtitle">Твоё комбо:</p>
-        <div class="combo-memes" style="margin: 8px 0 16px">
-          ${(S.submittedCombo ?? []).map(m => `<div class="combo-meme">${escapeHtml(m.title)}</div>`).join('')}
+        <p class="subtitle">Твой плеер улетел к судье</p>
+
+        <div class="decks">
+          <div class="deck">
+            ${deckFront(S.submittedCombo ?? [], { playing: false })}
+            <div class="deck-face deck-back">
+              <div class="deck-author">${escapeHtml(S.user?.username || S.guestName || 'Ты')}</div>
+            </div>
+          </div>
         </div>
+
         <div class="progress-bar"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
         <p class="counter">Ждём остальных: ${sub} / ${exp}</p>
       </div>
@@ -1250,7 +1336,7 @@ function renderJudgePicksWinner() {
       <div class="screen center">
         ${timerBadge()}
         <div class="prompt-display">${escapeHtml(S.prompt?.text || '')}</div>
-        <h2>Судья выбирает…</h2>
+        <h2>Судья слушает плееры…</h2>
         <div class="spinner"></div>
       </div>
     `;
@@ -1261,28 +1347,29 @@ function renderJudgePicksWinner() {
     <div class="screen">
       ${timerBadge()}
       <div class="prompt-display">${escapeHtml(S.prompt?.text || '')}</div>
-      <p class="subtitle">Послушай и выбери лучшее комбо</p>
-      <div class="combos">
+      <p class="subtitle">Тапни на плеер — выберешь. ▶ — послушать.</p>
+
+      <div class="decks">
         ${S.combos.map((c, i) => {
           const isPlaying = c.memes.some(m => audio.currentId === m.id);
           const comboJson = JSON.stringify(c.memes).replace(/'/g, '&#39;');
           return `
-            <div class="combo combo-judge">
-              <div class="combo-num">КОМБО #${i + 1}</div>
-              <div class="combo-memes">
-                ${c.memes.map(m => `<div class="combo-meme"><span class="meme-label">${escapeHtml(m.title)}</span></div>`).join('')}
-              </div>
-              <div class="combo-actions">
-                <button class="ghost-btn ${isPlaying ? 'playing' : ''}"
-                        onclick='playCombo(${comboJson})'>
-                  ${isPlaying ? '⏸ Играет…' : '▶ Послушать'}
-                </button>
-                <button class="primary" onclick="pickWinner('${c.pid}')">Выбрать</button>
+            <div class="deck ${isPlaying ? 'playing' : ''}"
+                 onclick="pickWinner('${c.pid}')">
+              ${deckFront(c.memes, {
+                playing: isPlaying,
+                playBtnJs: `playCombo(${comboJson})`,
+              })}
+              <div class="deck-face deck-back">
+                <div class="deck-author">Плеер #${i + 1}</div>
               </div>
             </div>
           `;
         }).join('')}
       </div>
+
+      <p class="deck-hint">Тапнул на плеер — выбрал победителя</p>
+
       ${S.toast ? `<div class="toast">${escapeHtml(S.toast)}</div>` : ''}
     </div>
   `;
@@ -1290,31 +1377,38 @@ function renderJudgePicksWinner() {
 
 function renderReveal() {
   const r = S.reveal;
+
   app.innerHTML = `
     <div class="screen">
       <div class="prompt-display">${escapeHtml(r.prompt?.text || '')}</div>
       <h2>Раскрытие</h2>
-      <div class="combos">
-        ${r.combos.map(c => {
+
+      <div class="decks">
+        ${r.combos.map((c, i) => {
           const isPlaying = c.memes.some(m => audio.currentId === m.id);
           const comboJson = JSON.stringify(c.memes).replace(/'/g, '&#39;');
+          const flipDelay = (1.2 + i * 0.25).toFixed(2);
           return `
-            <div class="combo ${c.isWinner ? 'winner' : ''}">
-              <div class="combo-author">${escapeHtml(c.playerName)}</div>
-              <div class="combo-memes">
-                ${c.memes.map(m => `<div class="combo-meme">${escapeHtml(m.title)}</div>`).join('')}
+            <div class="deck revealed ${c.isWinner ? 'winner' : ''} ${isPlaying ? 'playing' : ''}"
+                 style="--flip-delay: ${flipDelay}s">
+              ${deckFront(c.memes, {
+                playing: isPlaying,
+                clickable: true,
+                onClickJs: `playCombo(${comboJson})`,
+                playBtnInner: isPlaying ? '⏸' : '▶',
+                playBtnJs: `playCombo(${comboJson})`,
+              })}
+              <div class="deck-face deck-back">
+                <div class="deck-author">${escapeHtml(c.playerName)}</div>
+                ${c.isWinner ? '<div class="deck-badge">🏆</div>' : ''}
               </div>
-              <div class="combo-actions">
-                <button class="ghost-btn ${isPlaying ? 'playing' : ''}"
-                        onclick='playCombo(${comboJson})'>
-                  ${isPlaying ? '⏸ Играет…' : '▶ Послушать'}
-                </button>
-              </div>
-              ${c.isWinner ? '<div class="win-badge">🏆 ПОБЕДИТЕЛЬ</div>' : ''}
             </div>
           `;
         }).join('')}
       </div>
+
+      <p class="deck-hint">Тапни на плеер — прослушать ещё раз</p>
+
       ${S.toast ? `<div class="toast">${escapeHtml(S.toast)}</div>` : ''}
     </div>
   `;
@@ -1375,7 +1469,6 @@ Object.assign(window, {
   bindSettingsUI();
   render();
 
-  // Если пользователь уже тапнул, пока плейлист грузился — запускаем
   if (userInteracted && Settings.ambientOn) {
     ambient.start();
   }
