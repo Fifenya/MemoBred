@@ -4,6 +4,7 @@
 
 import { PHASES, EVENTS, DEFAULTS, DURATIONS } from './events.js';
 import { memesRepo, promptsRepo, gamesRepo, roundsRepo } from './db.js';
+import { updateStats } from './users.js';
 import { pickRandom, log } from './utils.js';
 import { addScore, setPhase, touch } from './rooms.js';
 
@@ -37,15 +38,14 @@ export function publicRoom(room) {
       id: p.id,
       token: p.token,
       name: p.name,
+      userId: p.userId,
+      isGuest: p.isGuest,
       score: p.score,
       connected: p.connected !== false,
     })),
   };
 }
 
-/**
- * Полное состояние игрока для rejoin — что показать после перезагрузки.
- */
 export function playerView(room, socketId) {
   const isJudge = room.round?.judgeId === socketId;
   const hand = room.round?.hands?.[socketId] ?? null;
@@ -90,11 +90,9 @@ function startTimer(room, io, durationMs, onExpire) {
   const end = Date.now() + durationMs;
   room.round.timerEnd = end;
 
-  // Каждые 1 сек шлём оставшееся время
   room.round.timerInterval = setInterval(() => {
     const remaining = Math.max(0, end - Date.now());
     io.to(room.code).emit(EVENTS.TIMER_TICK, { remaining });
-
     if (remaining <= 0) {
       clearInterval(room.round.timerInterval);
       room.round.timerInterval = null;
@@ -103,7 +101,6 @@ function startTimer(room, io, durationMs, onExpire) {
     }
   }, 1000);
 
-  // Первый tick сразу
   io.to(room.code).emit(EVENTS.TIMER_TICK, { remaining: durationMs });
 }
 
@@ -125,7 +122,7 @@ export function startGame(room, io) {
 
   room.gameId = gamesRepo.start(room.code, 'classic');
   for (const p of room.players) {
-    gamesRepo.savePlayer(room.gameId, p.name, 0);
+    gamesRepo.savePlayer(room.gameId, p.name, 0, p.userId ?? null);
   }
 
   room.roundNumber = 0;
@@ -184,9 +181,7 @@ export function startRound(room, io) {
 
   log('game', `${room.code} R${room.roundNumber}: судья «${judge.name}»`);
 
-  // Таймер на выбор задания
   startTimer(room, io, DURATIONS.JUDGE_PICKS_PROMPT, () => {
-    // Судья не успел — выбираем случайное
     if (room.phase !== PHASES.JUDGE_PICKS_PROMPT) return;
     const randomPrompt = pickRandom(promptOptions, 1)[0];
     log('game', `${room.code} R${room.roundNumber}: судья не успел, авто-выбор задания`);
@@ -195,7 +190,7 @@ export function startRound(room, io) {
 }
 
 // ============================================================
-// Фаза 2: судья выбрал задание
+// Фаза 2
 // ============================================================
 
 export function pickPrompt(room, socketId, promptId, io) {
@@ -215,7 +210,7 @@ function applyPrompt(room, prompt, io) {
 
   io.to(room.code).emit(EVENTS.PHASE_CHANGE, {
     phase: room.phase,
-    prompt,                             // всегда передаём — не затираем
+    prompt,
   });
   io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
 
@@ -229,7 +224,7 @@ function applyPrompt(room, prompt, io) {
 }
 
 // ============================================================
-// Фаза 3: игрок отправил комбо
+// Фаза 3
 // ============================================================
 
 export function submitCombo(room, socketId, memeIds, io) {
@@ -279,8 +274,6 @@ export function submitCombo(room, socketId, memeIds, io) {
 }
 
 function moveToJudgePicks(room, io) {
-  // Если никто не отправил — рандомное комбо от случайного игрока,
-  // чтобы не застрять
   if (Object.keys(room.round.submissions).length === 0) {
     const active = room.players.filter(
       p => p.connected !== false && p.id !== room.round.judgeId
@@ -313,7 +306,6 @@ function moveToJudgePicks(room, io) {
 
   startTimer(room, io, DURATIONS.JUDGE_PICKS_WINNER, () => {
     if (room.phase !== PHASES.JUDGE_PICKS_WINNER) return;
-    // Судья не выбрал — рандомный победитель
     const pids = Object.keys(room.round.submissions);
     if (pids.length > 0) {
       const randomWinner = pids[Math.floor(Math.random() * pids.length)];
@@ -324,7 +316,7 @@ function moveToJudgePicks(room, io) {
 }
 
 // ============================================================
-// Фаза 4: судья выбрал победителя
+// Фаза 4
 // ============================================================
 
 export function pickWinner(room, socketId, winnerPid, io) {
@@ -390,7 +382,7 @@ function scheduleNextPhase(room, io) {
 }
 
 // ============================================================
-// Финал
+// Финал — обновляем статистику юзеров
 // ============================================================
 
 function finishGame(room, io) {
@@ -404,10 +396,31 @@ function finishGame(room, io) {
   }
 
   const finalScores = [...room.players]
-    .map(p => ({ name: p.name, score: p.score }))
+    .map(p => ({
+      name: p.name,
+      score: p.score,
+      userId: p.userId ?? null,
+      isGuest: p.isGuest ?? true,
+    }))
     .sort((a, b) => b.score - a.score);
 
-  io.to(room.code).emit(EVENTS.GAME_OVER, { players: finalScores });
+  const winnerScore = finalScores[0]?.score ?? 0;
+
+  // Обновляем статистику зарегистрированных
+  for (const p of finalScores) {
+    if (!p.userId) continue;
+    try {
+      const isWinner = p.score === winnerScore;
+      updateStats(p.userId, p.score, isWinner);
+    } catch (e) {
+      log('game', 'Ошибка обновления статистики:', e.message);
+    }
+  }
+
+  io.to(room.code).emit(EVENTS.GAME_OVER, {
+    players: finalScores.map(p => ({ name: p.name, score: p.score, isGuest: p.isGuest })),
+  });
+
   log('game', `${room.code}: партия #${room.gameId} окончена, победитель «${finalScores[0]?.name}»`);
 }
 
@@ -441,7 +454,7 @@ function saveRoundToDb(room) {
     }
 
     for (const p of room.players) {
-      gamesRepo.savePlayer(room.gameId, p.name, p.score);
+      gamesRepo.savePlayer(room.gameId, p.name, p.score, p.userId ?? null);
     }
   } catch (e) {
     log('game', 'Ошибка сохранения раунда:', e.message);

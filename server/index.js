@@ -1,3 +1,7 @@
+// ============================================================
+// Точка входа: Express + Socket.IO + API + аутентификация.
+// ============================================================
+
 import express from 'express';
 import { createServer } from 'node:http';
 import { Server as SocketServer } from 'socket.io';
@@ -6,13 +10,14 @@ import os from 'node:os';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { EVENTS, PHASES, DEFAULTS } from './events.js';
+import { EVENTS, PHASES, DEFAULTS, LEADERBOARD_TYPES } from './events.js';
 import { log } from './utils.js';
 import { closeDb, memesRepo, promptsRepo } from './db.js';
 import { seedIfEmpty } from './seed.js';
 import {
-  publicRoom, startGame, pickPrompt, submitCombo,
-  pickWinner, handlePlayerLeave, playerView,
+  reloadPools, getMemesCount, getPromptsCount,
+  publicRoom, startGame, pickPrompt, submitCombo, pickWinner,
+  handlePlayerLeave, playerView,
 } from './game.js';
 import {
   createRoom, joinRoom, leaveRoom,
@@ -22,9 +27,14 @@ import {
   stats,
 } from './rooms.js';
 import {
-  publicRoom, startGame, pickPrompt, submitCombo,
-  pickWinner, handlePlayerLeave,
-} from './game.js';
+  register, login, verifySession, destroySession,
+  cleanupExpiredSessions,
+} from './auth.js';
+import {
+  findById as findUserById,
+  findByUsername as findUserByUsername,
+  leaderboard, recentGames, totalUsers,
+} from './users.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR   = path.join(__dirname, '..');
@@ -38,6 +48,10 @@ fs.mkdirSync(MEMES_DIR, { recursive: true });
 seedIfEmpty();
 reloadPools();
 
+// ============================================================
+// Express
+// ============================================================
+
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(PUBLIC_DIR, { extensions: ['html'], maxAge: '1h' }));
@@ -45,6 +59,10 @@ app.use('/memes', express.static(MEMES_DIR, {
   maxAge: '7d',
   setHeaders: (res) => res.setHeader('Cache-Control', 'public, max-age=604800'),
 }));
+
+// ============================================================
+// HTTP API
+// ============================================================
 
 app.get('/api/health', (_req, res) => {
   const s = stats();
@@ -56,17 +74,38 @@ app.get('/api/health', (_req, res) => {
     connected: s.connected,
     memes: getMemesCount(),
     prompts: getPromptsCount(),
+    users: totalUsers(),
   });
 });
 
 app.get('/api/stats', (_req, res) => {
-  res.json({ memes: getMemesCount(), prompts: getPromptsCount(), ...stats() });
+  res.json({
+    memes: getMemesCount(),
+    prompts: getPromptsCount(),
+    users: totalUsers(),
+    ...stats(),
+  });
+});
+
+app.get('/api/leaderboard', (req, res) => {
+  const type = LEADERBOARD_TYPES.includes(req.query.type) ? req.query.type : 'score';
+  res.json({ ok: true, type, entries: leaderboard(type) });
+});
+
+app.get('/api/profile/:username', (req, res) => {
+  const user = findUserByUsername(req.params.username);
+  if (!user) return res.status(404).json({ error: 'Не найден' });
+  res.json({
+    ok: true,
+    user,
+    recentGames: recentGames(user.id, 20),
+  });
 });
 
 app.post('/api/memes', (req, res) => {
   const { id, title, url, category, pack } = req.body || {};
   if (!id || !title || !category) {
-    return res.status(400).json({ error: 'id, title, category — обязательны' });
+    return res.status(400).json({ error: 'id, title, category обязательны' });
   }
   const finalUrl = url || `/memes/${id}.mp3`;
   memesRepo.insert({ id, title, url: finalUrl, category, pack: pack || 'custom' });
@@ -76,81 +115,188 @@ app.post('/api/memes', (req, res) => {
 
 app.post('/api/prompts', (req, res) => {
   const { id, text, category } = req.body || {};
-  if (!id || !text) return res.status(400).json({ error: 'id и text — обязательны' });
+  if (!id || !text) return res.status(400).json({ error: 'id и text обязательны' });
   promptsRepo.insert({ id, text, category: category || 'custom' });
   reloadPools();
   res.json({ ok: true, id });
 });
 
+// ============================================================
+// HTTP + Socket.IO
+// ============================================================
+
 const httpServer = createServer(app);
 const io = new SocketServer(httpServer, {
   cors: { origin: '*' },
-  pingTimeout: 30000,     // увеличили с 20 до 30 сек
+  pingTimeout: 30000,
   pingInterval: 25000,
 });
 
 // ============================================================
-// Socket-хендлеры
+// Помощники
+// ============================================================
+
+/**
+ * Достаёт пользователя из socket.data.user или null.
+ */
+function currentUser(socket) {
+  return socket.data?.user ?? null;
+}
+
+/**
+ * Публичное представление юзера для клиента.
+ */
+function publicUser(u) {
+  if (!u) return null;
+  return {
+    id: u.id,
+    username: u.username,
+    games_played: u.games_played ?? 0,
+    games_won: u.games_won ?? 0,
+    total_score: u.total_score ?? 0,
+    winrate: u.winrate ?? (u.games_played ? Math.round((u.games_won / u.games_played) * 100) : 0),
+    avg_score: u.avg_score ?? (u.games_played ? Math.round(u.total_score / u.games_played) : 0),
+  };
+}
+
+// ============================================================
+// Socket
 // ============================================================
 
 io.on('connection', (socket) => {
   log('sock', `+ ${socket.id.slice(0, 6)}`);
 
-  // ---------- Создание комнаты ----------
-socket.on(EVENTS.CREATE_ROOM, ({ name } = {}, cb) => {
-  try {
-    const room = createRoom(socket.id, name);
-    socket.join(room.code);
-    const token = room.players[0].token;
+  socket.data = { user: null };
 
-    cb?.({ ok: true, youId: socket.id, token, room: publicRoom(room) });
-    io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
-  } catch (e) {
-    log('sock', 'create_room error:', e.message);
-    cb?.({ ok: false, error: 'Не удалось создать комнату' });
-  }
-});
-
-// ---------- Вход в комнату ----------
-socket.on(EVENTS.JOIN_ROOM, ({ code, name } = {}, cb) => {
-  const result = joinRoom(code, socket.id, name);
-  if (!result.ok) return cb?.({ ok: false, error: result.error });
-
-  const { room, token } = result;
-  socket.join(room.code);
-  cb?.({ ok: true, youId: socket.id, token, room: publicRoom(room) });
-  io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
-});
-
-// ---------- REJOIN ----------
-socket.on(EVENTS.REJOIN, ({ token } = {}, cb) => {
-  const found = findByToken(token);
-  if (!found) return cb?.({ ok: false, error: 'Сессия истекла' });
-
-  const { room, player } = found;
-  restorePlayer(room, player, socket.id);
-  socket.join(room.code);
-
-  // Полное состояние игрока — включая hand, submitted, combos
-  const view = playerView(room, socket.id);
-
-  cb?.({
-    ok: true,
-    youId: socket.id,
-    room: publicRoom(room),
-    ...view,
+  // ---------- AUTH ----------
+  socket.on(EVENTS.AUTH, ({ token } = {}, cb) => {
+    if (!token) {
+      return cb?.({ ok: true, isGuest: true, user: null });
+    }
+    const user = verifySession(token);
+    if (!user) {
+      return cb?.({ ok: false, error: 'Сессия истекла', isGuest: true });
+    }
+    socket.data.user = user;
+    cb?.({ ok: true, isGuest: false, user: publicUser(user) });
   });
 
-  io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
+  // ---------- REGISTER ----------
+  socket.on(EVENTS.REGISTER, async ({ username, password } = {}, cb) => {
+    try {
+      const result = await register(username, password);
+      if (!result.ok) return cb?.(result);
 
-  // Если идёт таймер — досылаем его текущее значение
-  if (room.round?.timerEnd) {
-    const remaining = Math.max(0, room.round.timerEnd - Date.now());
-    socket.emit(EVENTS.TIMER_TICK, { remaining });
-  }
-});
+      const user = verifySession(result.token);
+      if (user) socket.data.user = user;
 
-  // ---------- Явный выход ----------
+      cb?.({ ok: true, token: result.token, user: publicUser(user ?? result.user) });
+    } catch (e) {
+      log('auth', 'register error:', e.message);
+      cb?.({ ok: false, error: 'Ошибка сервера' });
+    }
+  });
+
+  // ---------- LOGIN ----------
+  socket.on(EVENTS.LOGIN, async ({ username, password } = {}, cb) => {
+    try {
+      const result = await login(username, password);
+      if (!result.ok) return cb?.(result);
+
+      const user = verifySession(result.token);
+      if (user) socket.data.user = user;
+
+      cb?.({ ok: true, token: result.token, user: publicUser(user ?? result.user) });
+    } catch (e) {
+      log('auth', 'login error:', e.message);
+      cb?.({ ok: false, error: 'Ошибка сервера' });
+    }
+  });
+
+  // ---------- LOGOUT ----------
+  socket.on(EVENTS.LOGOUT, ({ token } = {}, cb) => {
+    if (token) destroySession(token);
+    socket.data.user = null;
+    cb?.({ ok: true });
+  });
+
+  // ---------- GET_PROFILE ----------
+  socket.on(EVENTS.GET_PROFILE, ({ userId } = {}, cb) => {
+    const targetId = userId ?? socket.data.user?.id;
+    if (!targetId) return cb?.({ ok: false, error: 'Требуется аккаунт' });
+
+    const user = findUserById(targetId);
+    if (!user) return cb?.({ ok: false, error: 'Не найден' });
+
+    cb?.({ ok: true, user, recentGames: recentGames(targetId, 20) });
+  });
+
+  // ---------- GET_LEADERBOARD ----------
+  socket.on(EVENTS.GET_LEADERBOARD, ({ type } = {}, cb) => {
+    const t = LEADERBOARD_TYPES.includes(type) ? type : 'score';
+    cb?.({ ok: true, type: t, entries: leaderboard(t) });
+  });
+
+  // ==========================================================
+  // Комнаты
+  // ==========================================================
+
+  socket.on(EVENTS.CREATE_ROOM, ({ name } = {}, cb) => {
+    try {
+      const user = currentUser(socket);
+      const room = createRoom(socket.id, name, user);
+      socket.join(room.code);
+
+      const token = room.players[0].token;
+      cb?.({ ok: true, youId: socket.id, token, room: publicRoom(room) });
+      io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
+    } catch (e) {
+      log('sock', 'create_room error:', e.message);
+      cb?.({ ok: false, error: 'Не удалось создать комнату' });
+    }
+  });
+
+  socket.on(EVENTS.JOIN_ROOM, ({ code, name } = {}, cb) => {
+    try {
+      const user = currentUser(socket);
+      const result = joinRoom(code, socket.id, name, user);
+      if (!result.ok) return cb?.(result);
+
+      const { room, token } = result;
+      socket.join(room.code);
+      cb?.({ ok: true, youId: socket.id, token, room: publicRoom(room) });
+      io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
+    } catch (e) {
+      log('sock', 'join_room error:', e.message);
+      cb?.({ ok: false, error: 'Ошибка сервера' });
+    }
+  });
+
+  socket.on(EVENTS.REJOIN, ({ token } = {}, cb) => {
+    const found = findByToken(token);
+    if (!found) return cb?.({ ok: false, error: 'Сессия истекла' });
+
+    const { room, player } = found;
+    restorePlayer(room, player, socket.id);
+    socket.join(room.code);
+
+    const view = playerView(room, socket.id);
+
+    cb?.({
+      ok: true,
+      youId: socket.id,
+      room: publicRoom(room),
+      ...view,
+    });
+
+    io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
+
+    if (room.round?.timerEnd) {
+      const remaining = Math.max(0, room.round.timerEnd - Date.now());
+      socket.emit(EVENTS.TIMER_TICK, { remaining });
+    }
+  });
+
   socket.on(EVENTS.LEAVE_ROOM, () => {
     const room = getRoomBySocket(socket.id);
     if (!room) return;
@@ -160,7 +306,6 @@ socket.on(EVENTS.REJOIN, ({ token } = {}, cb) => {
     if (updated) io.to(updated.code).emit(EVENTS.ROOM_STATE, publicRoom(updated));
   });
 
-  // ---------- Старт партии ----------
   socket.on(EVENTS.START_GAME, () => {
     const room = getRoomBySocket(socket.id);
     if (!room) return;
@@ -196,41 +341,39 @@ socket.on(EVENTS.REJOIN, ({ token } = {}, cb) => {
     pickWinner(room, socket.id, pid, io);
   });
 
-  // ---------- Дисконнект — ТОЛЬКО помечаем ----------
+  // ---------- Disconnect ----------
   socket.on('disconnect', (reason) => {
     log('sock', `- ${socket.id.slice(0, 6)} (${reason})`);
     const room = markDisconnected(socket.id);
     if (room) {
-      // Уведомляем остальных, что кто-то отключился (но не удаляем)
       io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
     }
   });
 });
 
 // ============================================================
-// Периодический cleanup
+// Периодические задачи
 // ============================================================
 
-// Быстрый — каждые 10 сек убирает тех, кто не вернулся
 const fastCleanup = setInterval(() => {
   try {
     const changed = cleanupDisconnectedPlayers();
     for (const room of changed) {
       if (room) {
-        // Если партия активна и ушёл кто-то важный — пересчитаем
         try { handlePlayerLeave(room, '__expired__', io); } catch {}
         io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
       }
     }
-  } catch (e) {
-    log('cron', 'fast cleanup error:', e.message);
-  }
+  } catch (e) { log('cron', 'fast cleanup error:', e.message); }
 }, 10_000);
 
-// Медленный — раз в 10 минут убирает давно пустые комнаты
 const slowCleanup = setInterval(() => {
   try { cleanupStaleRooms(); } catch (e) { log('cron', 'slow cleanup error:', e.message); }
 }, 10 * 60_000);
+
+const sessionCleanup = setInterval(() => {
+  try { cleanupExpiredSessions(); } catch (e) { log('cron', 'session cleanup error:', e.message); }
+}, 60 * 60_000);
 
 // ============================================================
 // Запуск
@@ -246,6 +389,7 @@ httpServer.listen(PORT, HOST, () => {
     '',
     `  Мемов:      ${getMemesCount()}`,
     `  Заданий:    ${getPromptsCount()}`,
+    `  Юзеров:     ${totalUsers()}`,
     `  Node:       ${process.version}`,
     '',
   ].join('\n'));
@@ -270,9 +414,13 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   log('sys', `Получен ${signal}, останавливаюсь…`);
+
   clearInterval(fastCleanup);
   clearInterval(slowCleanup);
+  clearInterval(sessionCleanup);
+
   io.emit(EVENTS.ERROR, { message: 'Сервер останавливается' });
+
   io.close(() => {
     httpServer.close(() => {
       closeDb();
@@ -280,6 +428,7 @@ function shutdown(signal) {
       process.exit(0);
     });
   });
+
   setTimeout(() => process.exit(1), 5000);
 }
 

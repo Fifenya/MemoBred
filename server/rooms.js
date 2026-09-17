@@ -1,3 +1,8 @@
+// ============================================================
+// Комнаты в памяти.
+// Игрок может быть гостем (userId = null) или зарегистрированным.
+// ============================================================
+
 import { generateCode, sanitizeName, generateToken, log } from './utils.js';
 import { PHASES, DEFAULTS } from './events.js';
 
@@ -8,8 +13,13 @@ const socketToRoom = new Map();
 // Создание / вход
 // ============================================================
 
-export function createRoom(socketId, rawName) {
-  const name = sanitizeName(rawName) || 'Хост';
+/**
+ * @param {string}  socketId
+ * @param {string}  rawName
+ * @param {object?} user   — { id, username } если залогинен, иначе null
+ */
+export function createRoom(socketId, rawName, user = null) {
+  const name = user ? user.username : (sanitizeName(rawName) || 'Хост');
   const code = generateCode(c => rooms.has(c));
   const token = generateToken();
 
@@ -25,6 +35,8 @@ export function createRoom(socketId, rawName) {
       id: socketId,
       token,
       name,
+      userId: user?.id ?? null,
+      isGuest: !user,
       score: 0,
       connected: true,
       disconnectedAt: null,
@@ -36,11 +48,11 @@ export function createRoom(socketId, rawName) {
 
   rooms.set(code, room);
   socketToRoom.set(socketId, code);
-  log('room', `Создана ${code} хостом «${name}»`);
+  log('room', `Создана ${code} хостом «${name}»${user ? ` (id ${user.id})` : ' (гость)'}`);
   return room;
 }
 
-export function joinRoom(rawCode, socketId, rawName) {
+export function joinRoom(rawCode, socketId, rawName, user = null) {
   const code = String(rawCode || '').toUpperCase().trim();
   const room = rooms.get(code);
 
@@ -50,7 +62,12 @@ export function joinRoom(rawCode, socketId, rawName) {
     return { ok: false, error: `Комната полна (${DEFAULTS.MAX_PLAYERS})` };
   }
 
-  const name = sanitizeName(rawName) || `Игрок ${room.players.length + 1}`;
+  // Зарегистрированный юзер не может зайти дважды в одну комнату
+  if (user && room.players.some(p => p.userId === user.id)) {
+    return { ok: false, error: 'Ты уже в этой комнате' };
+  }
+
+  const name = user ? user.username : (sanitizeName(rawName) || `Игрок ${room.players.length + 1}`);
   const finalName = uniqueName(room, name);
   const token = generateToken();
 
@@ -58,6 +75,8 @@ export function joinRoom(rawCode, socketId, rawName) {
     id: socketId,
     token,
     name: finalName,
+    userId: user?.id ?? null,
+    isGuest: !user,
     score: 0,
     connected: true,
     disconnectedAt: null,
@@ -121,7 +140,7 @@ export function leaveRoom(socketId) {
 }
 
 // ============================================================
-// REJOIN по токену
+// REJOIN
 // ============================================================
 
 export function findByToken(token) {
@@ -138,7 +157,6 @@ export function restorePlayer(room, player, newSocketId) {
 
   if (oldId && oldId !== newSocketId) socketToRoom.delete(oldId);
 
-  // Мигрируем руку и комбо на новый socket.id
   if (room.round) {
     if (room.round.hands?.[oldId]) {
       room.round.hands[newSocketId] = room.round.hands[oldId];
@@ -156,7 +174,6 @@ export function restorePlayer(room, player, newSocketId) {
   player.disconnectedAt = null;
   socketToRoom.set(newSocketId, room.code);
 
-  // Хост вернулся — возвращаем роль
   if (room.hostToken === player.token) room.hostId = newSocketId;
 
   touch(room);
@@ -263,13 +280,19 @@ export function cleanupStaleRooms() {
   return removed;
 }
 
+// ============================================================
+// Диагностика
+// ============================================================
+
 export function stats() {
-  let totalPlayers = 0, connected = 0;
+  let totalPlayers = 0, connected = 0, guests = 0, registered = 0;
   for (const room of rooms.values()) {
     totalPlayers += room.players.length;
     connected += room.players.filter(p => p.connected).length;
+    guests += room.players.filter(p => p.isGuest).length;
+    registered += room.players.filter(p => !p.isGuest).length;
   }
-  return { rooms: rooms.size, players: totalPlayers, connected };
+  return { rooms: rooms.size, players: totalPlayers, connected, guests, registered };
 }
 
 function uniqueName(room, base) {
