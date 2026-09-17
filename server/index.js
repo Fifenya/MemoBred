@@ -1,8 +1,3 @@
-// ============================================================
-// Точка входа: Express + Socket.IO + статика + API.
-// Вся игровая логика — в game.js, комнаты — в rooms.js.
-// ============================================================
-
 import express from 'express';
 import { createServer } from 'node:http';
 import { Server as SocketServer } from 'socket.io';
@@ -12,14 +7,16 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import { EVENTS, PHASES, DEFAULTS } from './events.js';
-import { log, sanitizeName } from './utils.js';
+import { log } from './utils.js';
 import { closeDb, memesRepo, promptsRepo } from './db.js';
 import { seedIfEmpty } from './seed.js';
 import { reloadPools, getMemesCount, getPromptsCount } from './game.js';
 import {
   createRoom, joinRoom, leaveRoom,
-  getRoomBySocket, getPlayer, isHost,
-  cleanupStaleRooms, stats,
+  getRoomBySocket, getRoomByCode, isHost,
+  findBySession, restorePlayer,
+  markDisconnected, cleanupDisconnectedPlayers, cleanupStaleRooms,
+  stats,
 } from './rooms.js';
 import {
   publicRoom, startGame, pickPrompt, submitCombo,
@@ -34,36 +31,17 @@ const MEMES_DIR  = path.join(ROOT_DIR, 'memes');
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 
-// ============================================================
-// Подготовка данных
-// ============================================================
-
 fs.mkdirSync(MEMES_DIR, { recursive: true });
 seedIfEmpty();
 reloadPools();
 
-// ============================================================
-// Express
-// ============================================================
-
 const app = express();
 app.use(express.json({ limit: '1mb' }));
-
-// Статика клиента
-app.use(express.static(PUBLIC_DIR, {
-  extensions: ['html'],
-  maxAge: '1h',
-}));
-
-// MP3-мемы
+app.use(express.static(PUBLIC_DIR, { extensions: ['html'], maxAge: '1h' }));
 app.use('/memes', express.static(MEMES_DIR, {
   maxAge: '7d',
   setHeaders: (res) => res.setHeader('Cache-Control', 'public, max-age=604800'),
 }));
-
-// ============================================================
-// API
-// ============================================================
 
 app.get('/api/health', (_req, res) => {
   const s = stats();
@@ -72,20 +50,16 @@ app.get('/api/health', (_req, res) => {
     uptime: Math.round(process.uptime()),
     rooms: s.rooms,
     players: s.players,
+    connected: s.connected,
     memes: getMemesCount(),
     prompts: getPromptsCount(),
   });
 });
 
 app.get('/api/stats', (_req, res) => {
-  res.json({
-    memes: getMemesCount(),
-    prompts: getPromptsCount(),
-    rooms: stats().rooms,
-  });
+  res.json({ memes: getMemesCount(), prompts: getPromptsCount(), ...stats() });
 });
 
-// Добавить мем (для тестов / ручной заливки)
 app.post('/api/memes', (req, res) => {
   const { id, title, url, category, pack } = req.body || {};
   if (!id || !title || !category) {
@@ -97,25 +71,18 @@ app.post('/api/memes', (req, res) => {
   res.json({ ok: true, id, url: finalUrl });
 });
 
-// Добавить задание
 app.post('/api/prompts', (req, res) => {
   const { id, text, category } = req.body || {};
-  if (!id || !text) {
-    return res.status(400).json({ error: 'id и text — обязательны' });
-  }
+  if (!id || !text) return res.status(400).json({ error: 'id и text — обязательны' });
   promptsRepo.insert({ id, text, category: category || 'custom' });
   reloadPools();
   res.json({ ok: true, id });
 });
 
-// ============================================================
-// HTTP + Socket.IO
-// ============================================================
-
 const httpServer = createServer(app);
 const io = new SocketServer(httpServer, {
-  cors: { origin: '*' },   // локальная игра — открыто
-  pingTimeout: 20000,
+  cors: { origin: '*' },
+  pingTimeout: 30000,     // увеличили с 20 до 30 сек
   pingInterval: 25000,
 });
 
@@ -127,11 +94,10 @@ io.on('connection', (socket) => {
   log('sock', `+ ${socket.id.slice(0, 6)}`);
 
   // ---------- Создание комнаты ----------
-  socket.on(EVENTS.CREATE_ROOM, ({ name } = {}, cb) => {
+  socket.on(EVENTS.CREATE_ROOM, ({ name, sessionId } = {}, cb) => {
     try {
-      const room = createRoom(socket.id, name);
+      const room = createRoom(socket.id, name, sessionId);
       socket.join(room.code);
-
       cb?.({ ok: true, youId: socket.id, room: publicRoom(room) });
       io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
     } catch (e) {
@@ -141,20 +107,54 @@ io.on('connection', (socket) => {
   });
 
   // ---------- Вход в комнату ----------
-  socket.on(EVENTS.JOIN_ROOM, ({ code, name } = {}, cb) => {
-    const result = joinRoom(code, socket.id, name);
+  socket.on(EVENTS.JOIN_ROOM, ({ code, name, sessionId } = {}, cb) => {
+    const result = joinRoom(code, socket.id, name, sessionId);
     if (!result.ok) return cb?.({ ok: false, error: result.error });
 
     const room = result.room;
     socket.join(room.code);
-
     cb?.({ ok: true, youId: socket.id, room: publicRoom(room) });
+    io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
+  });
+
+  // ---------- REJOIN после reconnect ----------
+  socket.on(EVENTS.REJOIN, ({ sessionId, code } = {}, cb) => {
+    const found = findBySession(sessionId);
+    if (!found) {
+      return cb?.({ ok: false, error: 'Сессия истекла' });
+    }
+    const { room, player } = found;
+    if (code && room.code !== String(code).toUpperCase()) {
+      return cb?.({ ok: false, error: 'Код не совпадает' });
+    }
+
+    restorePlayer(room, player, socket.id);
+    socket.join(room.code);
+
+    // Приватное состояние — то, что игрок должен видеть
+    const hand = room.round?.hands?.[socket.id] ?? null;
+    const isJudgeNow = room.round?.judgeId === socket.id;
+    const promptOptions = isJudgeNow ? room.round.promptOptions : null;
+
+    cb?.({
+      ok: true,
+      youId: socket.id,
+      room: publicRoom(room),
+      hand,
+      promptOptions,
+    });
+
     io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
   });
 
   // ---------- Явный выход ----------
   socket.on(EVENTS.LEAVE_ROOM, () => {
-    handleDisconnect(socket, { explicit: true });
+    const room = getRoomBySocket(socket.id);
+    if (!room) return;
+    try { handlePlayerLeave(room, socket.id, io); } catch {}
+    const updated = leaveRoom(socket.id);
+    socket.leave(room.code);
+    if (updated) io.to(updated.code).emit(EVENTS.ROOM_STATE, publicRoom(updated));
   });
 
   // ---------- Старт партии ----------
@@ -174,72 +174,60 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ---------- Судья выбрал задание ----------
   socket.on(EVENTS.PICK_PROMPT, ({ promptId } = {}) => {
     const room = getRoomBySocket(socket.id);
     if (!room) return;
     pickPrompt(room, socket.id, promptId, io);
   });
 
-  // ---------- Игрок отправил комбо ----------
   socket.on(EVENTS.SUBMIT_COMBO, ({ memeIds } = {}, cb) => {
     const room = getRoomBySocket(socket.id);
     if (!room) return cb?.({ ok: false, error: 'Нет комнаты' });
-
     const result = submitCombo(room, socket.id, memeIds, io);
     cb?.(result);
   });
 
-  // ---------- Судья выбрал победителя ----------
   socket.on(EVENTS.PICK_WINNER, ({ pid } = {}) => {
     const room = getRoomBySocket(socket.id);
     if (!room) return;
     pickWinner(room, socket.id, pid, io);
   });
 
-  // ---------- Дисконнект ----------
+  // ---------- Дисконнект — ТОЛЬКО помечаем ----------
   socket.on('disconnect', (reason) => {
     log('sock', `- ${socket.id.slice(0, 6)} (${reason})`);
-    handleDisconnect(socket);
+    const room = markDisconnected(socket.id);
+    if (room) {
+      // Уведомляем остальных, что кто-то отключился (но не удаляем)
+      io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
+    }
   });
 });
 
 // ============================================================
-// Обработка выхода игрока
+// Периодический cleanup
 // ============================================================
 
-function handleDisconnect(socket, { explicit = false } = {}) {
-  const room = getRoomBySocket(socket.id);
-  if (!room) return;
-
-  // Сначала — сообщаем игровой логике (может перестроить раунд)
+// Быстрый — каждые 10 сек убирает тех, кто не вернулся
+const fastCleanup = setInterval(() => {
   try {
-    handlePlayerLeave(room, socket.id, io);
+    const changed = cleanupDisconnectedPlayers();
+    for (const room of changed) {
+      if (room) {
+        // Если партия активна и ушёл кто-то важный — пересчитаем
+        try { handlePlayerLeave(room, '__expired__', io); } catch {}
+        io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
+      }
+    }
   } catch (e) {
-    log('sock', 'handlePlayerLeave error:', e.message);
+    log('cron', 'fast cleanup error:', e.message);
   }
+}, 10_000);
 
-  // Потом — убираем из комнаты
-  const updated = leaveRoom(socket.id);
-  socket.leave(room.code);
-
-  // Если комната жива — оповещаем остальных
-  if (updated) {
-    io.to(updated.code).emit(EVENTS.ROOM_STATE, publicRoom(updated));
-  }
-}
-
-// ============================================================
-// Периодическая очистка мёртвых комнат
-// ============================================================
-
-const cleanupTimer = setInterval(() => {
-  try {
-    cleanupStaleRooms();
-  } catch (e) {
-    log('cron', 'cleanup error:', e.message);
-  }
-}, 10 * 60 * 1000); // каждые 10 минут
+// Медленный — раз в 10 минут убирает давно пустые комнаты
+const slowCleanup = setInterval(() => {
+  try { cleanupStaleRooms(); } catch (e) { log('cron', 'slow cleanup error:', e.message); }
+}, 10 * 60_000);
 
 // ============================================================
 // Запуск
@@ -247,7 +235,7 @@ const cleanupTimer = setInterval(() => {
 
 httpServer.listen(PORT, HOST, () => {
   const ip = getLanIp();
-  const lines = [
+  console.log([
     '',
     '  🎵  МемоБред запущен',
     `  Локально:   http://localhost:${PORT}`,
@@ -257,21 +245,14 @@ httpServer.listen(PORT, HOST, () => {
     `  Заданий:    ${getPromptsCount()}`,
     `  Node:       ${process.version}`,
     '',
-  ];
-  console.log(lines.join('\n'));
+  ].join('\n'));
 });
-
-// ============================================================
-// Определение LAN-адреса (для показа в терминале)
-// ============================================================
 
 function getLanIp() {
   const nets = os.networkInterfaces();
   for (const name of Object.keys(nets)) {
     for (const net of nets[name] || []) {
-      if (net.family === 'IPv4' && !net.internal) {
-        return net.address;
-      }
+      if (net.family === 'IPv4' && !net.internal) return net.address;
     }
   }
   return 'localhost';
@@ -282,17 +263,13 @@ function getLanIp() {
 // ============================================================
 
 let shuttingDown = false;
-
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-
   log('sys', `Получен ${signal}, останавливаюсь…`);
-
-  clearInterval(cleanupTimer);
-
+  clearInterval(fastCleanup);
+  clearInterval(slowCleanup);
   io.emit(EVENTS.ERROR, { message: 'Сервер останавливается' });
-
   io.close(() => {
     httpServer.close(() => {
       closeDb();
@@ -300,21 +277,10 @@ function shutdown(signal) {
       process.exit(0);
     });
   });
-
-  // Форс-выход через 5 секунд, если что-то зависло
-  setTimeout(() => {
-    log('sys', 'Форс-выход по таймауту');
-    process.exit(1);
-  }, 5000);
+  setTimeout(() => process.exit(1), 5000);
 }
 
 process.on('SIGINT',  () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-process.on('uncaughtException', (e) => {
-  log('sys', 'uncaughtException:', e.stack || e.message);
-});
-
-process.on('unhandledRejection', (e) => {
-  log('sys', 'unhandledRejection:', e?.stack || e);
-});
+process.on('uncaughtException',  (e) => log('sys', 'uncaughtException:', e.stack || e.message));
+process.on('unhandledRejection', (e) => log('sys', 'unhandledRejection:', e?.stack || e));

@@ -22,7 +22,6 @@ mkdir -p "$DIR"
 if command -v sqlite3 >/dev/null 2>&1; then
   sqlite3 "$DB" "VACUUM INTO '$OUT';"
 else
-  # Fallback: node + встроенный модуль
   node -e "
     const { DatabaseSync } = require('node:sqlite');
     const db = new DatabaseSync('$DB');

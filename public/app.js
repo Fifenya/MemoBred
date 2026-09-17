@@ -1,85 +1,95 @@
 /* ============================================================
-   МемоБред — клиент.
-   Vanilla JS, без сборки. Общается с сервером через Socket.IO.
+   МемоБред — клиент с авто-восстановлением сессии.
+   sessionStorage — свой у каждой вкладки (не пересекаются).
    ============================================================ */
 
-const socket = io({ reconnectionDelay: 500, reconnectionAttempts: 20 });
+const socket = io({
+  reconnectionDelay: 500,
+  reconnectionAttempts: 30,
+  reconnectionDelayMax: 5000,
+});
+
+// ---------- Сессия в sessionStorage ----------
+const SESSION_KEY = 'memobred_session';
+const ROOM_KEY    = 'memobred_room';
+
+function getSessionId() {
+  let sid = sessionStorage.getItem(SESSION_KEY);
+  if (!sid) {
+    sid = (crypto?.randomUUID?.() || (Date.now() + '-' + Math.random().toString(36).slice(2)));
+    sessionStorage.setItem(SESSION_KEY, sid);
+  }
+  return sid;
+}
+
+const SESSION_ID = getSessionId();
 
 // ---------- Состояние ----------
 const S = {
   connected: false,
+  reconnecting: false,
   youId: null,
-  room: null,          // публичное состояние (code, phase, players, judgeId, ...)
-  hand: [],            // приватная рука (для игрока)
-  promptOptions: [],   // 3 варианта задания (для судьи)
-  prompt: null,        // выбранное задание (для всех)
-  combos: [],          // анонимные комбо (для судьи)
-  reveal: null,        // раскрытие
-  gameOver: null,      // финал
-  progress: null,      // {submitted, expected}
-  selected: [],        // выбранные мемы игрока
-  toast: null,         // текст всплывающего сообщения
+  room: null,
+  hand: [],
+  promptOptions: [],
+  prompt: null,
+  combos: [],
+  reveal: null,
+  gameOver: null,
+  progress: null,
+  selected: [],
+  toast: null,
 };
 
 const app = document.getElementById('app');
 let toastTimer = null;
 
+// Сброс всего игрового состояния (кроме sessionId)
+function resetGameState() {
+  S.room = null;
+  S.hand = [];
+  S.promptOptions = [];
+  S.prompt = null;
+  S.combos = [];
+  S.reveal = null;
+  S.gameOver = null;
+  S.progress = null;
+  S.selected = [];
+  audio.stop();
+}
+
 // ============================================================
-// Аудио-менеджер
-// Один трек за раз. Toggle по повторному клику. Стоп при смене фазы.
+// Аудио
 // ============================================================
 
 const audio = {
-  current: null,        // HTMLAudioElement
-  currentId: null,      // id мема, который играет (для подсветки кнопки)
-  sequenceToken: 0,     // для отмены последовательного воспроизведения
+  current: null,
+  currentId: null,
+  sequenceToken: 0,
 
   stop() {
     this.sequenceToken++;
     if (this.current) {
-      try {
-        this.current.pause();
-        this.current.currentTime = 0;
-      } catch {}
+      try { this.current.pause(); this.current.currentTime = 0; } catch {}
       this.current = null;
     }
     this.currentId = null;
   },
 
-  /**
-   * Играет один мем. Если этот же мем уже играет — стопает (toggle).
-   */
   async play(meme) {
-    if (!meme?.url) {
-      showToast('У этого мема нет звука');
-      return;
-    }
-
-    // Повторный клик по играющему — стоп
-    if (this.currentId === meme.id) {
-      this.stop();
-      render();
-      return;
-    }
+    if (!meme?.url) return showToast('У этого мема нет звука');
+    if (this.currentId === meme.id) { this.stop(); render(); return; }
 
     this.stop();
     const token = this.sequenceToken;
-
     const a = new Audio(meme.url);
     a.volume = 0.85;
     this.current = a;
     this.currentId = meme.id;
     render();
 
-    try {
-      await a.play();
-    } catch (e) {
-      console.warn('Audio play failed:', e);
-      this.stop();
-      render();
-      showToast('Не удалось воспроизвести звук');
-      return;
-    }
+    try { await a.play(); }
+    catch { this.stop(); render(); return showToast('Не удалось воспроизвести'); }
 
     a.addEventListener('ended', () => {
       if (token === this.sequenceToken) {
@@ -90,10 +100,6 @@ const audio = {
     }, { once: true });
   },
 
-  /**
-   * Играет массив мемов последовательно.
-   * Пауза 150 мс между мемами. Максимум 5 сек на трек.
-   */
   async playSequence(memes) {
     this.stop();
     const token = ++this.sequenceToken;
@@ -108,20 +114,12 @@ const audio = {
       this.currentId = m.id;
       render();
 
-      try {
-        await a.play();
-      } catch {
-        continue;
-      }
+      try { await a.play(); } catch { continue; }
 
       await new Promise((resolve) => {
         const t = setTimeout(resolve, 5000);
-        a.addEventListener('ended', () => {
-          clearTimeout(t);
-          resolve();
-        }, { once: true });
+        a.addEventListener('ended', () => { clearTimeout(t); resolve(); }, { once: true });
       });
-
       await new Promise(r => setTimeout(r, 150));
     }
 
@@ -153,57 +151,73 @@ function showToast(text) {
 }
 
 // ============================================================
-// Socket — входящие события
+// Socket — входящие
 // ============================================================
 
 socket.on('connect', () => {
   S.connected = true;
   S.youId = socket.id;
+
+  const savedRoom = sessionStorage.getItem(ROOM_KEY);
+
+  // Нет сохранённой сессии — сразу показываем главный
+  if (!savedRoom) {
+    S.reconnecting = false;
+    render();
+    return;
+  }
+
+  // Есть — пытаемся восстановиться
+  S.reconnecting = true;
   render();
+
+  socket.emit('rejoin', { sessionId: SESSION_ID, code: savedRoom }, (res) => {
+    S.reconnecting = false;
+
+    if (res?.ok) {
+      S.youId = res.youId;
+      S.room = res.room;
+      if (res.hand) S.hand = res.hand;
+      if (res.promptOptions) S.promptOptions = res.promptOptions;
+      render();
+      return;
+    }
+
+    // --- ВОТ ФИКС: сбрасываем ВСЁ, а не только sessionStorage ---
+    sessionStorage.removeItem(ROOM_KEY);
+    resetGameState();
+    render();
+  });
 });
 
 socket.on('disconnect', () => {
   S.connected = false;
+  // S.room НЕ трогаем — вдруг reconnect вернёт нас в ту же комнату
   render();
 });
 
 socket.on('room_state', (room) => {
-  // Вышли из партии — гасим звук
   if (room.phase === 'lobby' && S.room?.phase && S.room.phase !== 'lobby') {
     audio.stop();
   }
-
   S.room = room;
 
   if (room.phase === 'lobby') {
-    S.hand = [];
-    S.combos = [];
-    S.reveal = null;
-    S.gameOver = null;
-    S.promptOptions = [];
-    S.prompt = null;
-    S.selected = [];
-    S.progress = null;
+    S.hand = []; S.combos = []; S.reveal = null; S.gameOver = null;
+    S.promptOptions = []; S.prompt = null; S.selected = []; S.progress = null;
   }
   render();
 });
 
 socket.on('phase_change', (data) => {
-  audio.stop();                    // новая фаза — старые звуки не играют
+  audio.stop();
   S.prompt = data.prompt ?? null;
   S.selected = [];
 
-  if (data.phase === 'judge_picks_prompt') {
-    S.promptOptions = [];
-  }
-  if (data.phase !== 'reveal') {
-    S.reveal = null;
-  }
+  if (data.phase === 'judge_picks_prompt') S.promptOptions = [];
+  if (data.phase !== 'reveal') S.reveal = null;
   if (data.phase === 'players_submit') {
-    S.progress = {
-      submitted: 0,
-      expected: Math.max(0, (S.room?.players.length ?? 1) - 1),
-    };
+    S.progress = { submitted: 0, expected: Math.max(0, (S.room?.players.length ?? 1) - 1) };
   }
   render();
 });
@@ -215,11 +229,8 @@ socket.on('your_hand', ({ hand }) => {
 });
 
 socket.on('submissions', (data) => {
-  if (data.type === 'prompt_options') {
-    S.promptOptions = data.options ?? [];
-  } else if (data.type === 'combos') {
-    S.combos = data.combos ?? [];
-  }
+  if (data.type === 'prompt_options') S.promptOptions = data.options ?? [];
+  else if (data.type === 'combos')   S.combos = data.combos ?? [];
   render();
 });
 
@@ -239,6 +250,7 @@ socket.on('reveal', (data) => {
 socket.on('game_over', (data) => {
   audio.stop();
   S.gameOver = data;
+  sessionStorage.removeItem(ROOM_KEY);
   render();
 });
 
@@ -247,17 +259,18 @@ socket.on('error', ({ message }) => {
 });
 
 // ============================================================
-// Действия игрока
+// Действия
 // ============================================================
 
 function createRoom() {
   const name = ($('name-input')?.value || '').trim();
   if (!name) return showToast('Введи имя');
 
-  socket.emit('create_room', { name }, (res) => {
+  socket.emit('create_room', { name, sessionId: SESSION_ID }, (res) => {
     if (!res?.ok) return showToast(res?.error || 'Ошибка');
     S.youId = res.youId;
     S.room = res.room;
+    sessionStorage.setItem(ROOM_KEY, res.room.code);
     render();
   });
 }
@@ -268,46 +281,31 @@ function joinRoom() {
   if (!name) return showToast('Введи имя');
   if (code.length !== 4) return showToast('Код — 4 буквы');
 
-  socket.emit('join_room', { name, code }, (res) => {
+  socket.emit('join_room', { name, code, sessionId: SESSION_ID }, (res) => {
     if (!res?.ok) return showToast(res?.error || 'Ошибка');
     S.youId = res.youId;
     S.room = res.room;
+    sessionStorage.setItem(ROOM_KEY, res.room.code);
     render();
   });
 }
 
-function startGame() {
-  socket.emit('start_game');
-}
+function startGame() { socket.emit('start_game'); }
 
 function leaveRoom() {
-  audio.stop();
   socket.emit('leave_room');
-  S.room = null;
-  S.hand = [];
-  S.reveal = null;
-  S.gameOver = null;
-  S.combos = [];
-  S.promptOptions = [];
-  S.prompt = null;
-  S.selected = [];
-  S.progress = null;
+  sessionStorage.removeItem(ROOM_KEY);
+  resetGameState();
   render();
 }
 
-function pickPrompt(promptId) {
-  socket.emit('pick_prompt', { promptId });
-}
+function pickPrompt(promptId) { socket.emit('pick_prompt', { promptId }); }
 
 function toggleMeme(memeId) {
   const idx = S.selected.indexOf(memeId);
-  if (idx >= 0) {
-    S.selected.splice(idx, 1);
-  } else if (S.selected.length < 2) {
-    S.selected.push(memeId);
-  } else {
-    showToast('Максимум 2 мема');
-  }
+  if (idx >= 0) S.selected.splice(idx, 1);
+  else if (S.selected.length < 2) S.selected.push(memeId);
+  else showToast('Максимум 2 мема');
   render();
 }
 
@@ -320,29 +318,39 @@ function submitCombo() {
   });
 }
 
-function pickWinner(pid) {
-  socket.emit('pick_winner', { pid });
-}
+function pickWinner(pid) { socket.emit('pick_winner', { pid }); }
 
 function playMeme(memeId) {
   const meme = S.hand.find(m => m.id === memeId);
   if (meme) audio.play(meme);
 }
 
-function playCombo(memes) {
-  audio.playSequence(memes);
-}
+function playCombo(memes) { audio.playSequence(memes); }
 
 // ============================================================
-// Рендер — точка входа
+// Рендер
 // ============================================================
 
 function render() {
+  // Нет соединения
   if (!S.connected) {
     app.innerHTML = `
       <div class="screen center">
         <h1 class="logo">🎵 МемоБред</h1>
         <p class="subtitle">Подключение…</p>
+        <div class="spinner"></div>
+        ${S.room?.code ? `<p class="hint">Восстанавливаю комнату ${escapeHtml(S.room.code)}</p>` : ''}
+      </div>
+    `;
+    return;
+  }
+
+  // Идёт восстановление
+  if (S.reconnecting) {
+    app.innerHTML = `
+      <div class="screen center">
+        <h1 class="logo">🎵 МемоБред</h1>
+        <p class="subtitle">Восстанавливаю сессию…</p>
         <div class="spinner"></div>
       </div>
     `;
@@ -362,10 +370,7 @@ function render() {
   }
 }
 
-// ============================================================
-// Экран: главный
-// ============================================================
-
+// ---------- Главный ----------
 function renderMain() {
   app.innerHTML = `
     <div class="screen center">
@@ -383,26 +388,18 @@ function renderMain() {
         <button class="secondary" onclick="joinRoom()">Войти по коду</button>
       </div>
 
-      <p class="hint">Для партии нужно 3+ игрока. Один создаёт — остальные заходят по коду.</p>
+      <p class="hint">Для партии нужно 3+ игрока.</p>
 
       ${S.toast ? `<div class="toast">${escapeHtml(S.toast)}</div>` : ''}
     </div>
   `;
 
   setTimeout(() => $('name-input')?.focus(), 50);
-
-  $('code-input')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') joinRoom();
-  });
-  $('name-input')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') $('code-input')?.focus();
-  });
+  $('code-input')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') joinRoom(); });
+  $('name-input')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') $('code-input')?.focus(); });
 }
 
-// ============================================================
-// Экран: лобби
-// ============================================================
-
+// ---------- Лобби ----------
 function renderLobby() {
   const r = S.room;
   const isHost = r.hostId === S.youId;
@@ -438,10 +435,7 @@ function renderLobby() {
   `;
 }
 
-// ============================================================
-// Экран: судья выбирает задание
-// ============================================================
-
+// ---------- Судья выбирает задание ----------
 function renderJudgePicksPrompt() {
   const r = S.room;
   const isJudge = r.judgeId === S.youId;
@@ -475,10 +469,7 @@ function renderJudgePicksPrompt() {
   `;
 }
 
-// ============================================================
-// Экран: игроки отправляют комбо
-// ============================================================
-
+// ---------- Игроки отправляют ----------
 function renderPlayersSubmit() {
   const r = S.room;
   const isJudge = r.judgeId === S.youId;
@@ -516,12 +507,11 @@ function renderPlayersSubmit() {
       <div class="hand">
         ${S.hand.map(m => {
           const selected = S.selected.includes(m.id);
-          const playing  = audio.currentId === m.id;
+          const playing = audio.currentId === m.id;
           return `
             <div class="meme-row ${selected ? 'selected' : ''}">
               <button class="play-btn ${playing ? 'playing' : ''}"
-                      onclick="playMeme('${m.id}')"
-                      aria-label="Прослушать">
+                      onclick="playMeme('${m.id}')" aria-label="Прослушать">
                 ${playing ? '⏸' : '▶'}
               </button>
               <button class="meme-title" onclick="toggleMeme('${m.id}')">
@@ -541,10 +531,7 @@ function renderPlayersSubmit() {
   `;
 }
 
-// ============================================================
-// Экран: судья выбирает победителя
-// ============================================================
-
+// ---------- Судья выбирает победителя ----------
 function renderJudgePicksWinner() {
   const r = S.room;
   const isJudge = r.judgeId === S.youId;
@@ -598,10 +585,7 @@ function renderJudgePicksWinner() {
   `;
 }
 
-// ============================================================
-// Экран: раскрытие
-// ============================================================
-
+// ---------- Раскрытие ----------
 function renderReveal() {
   const r = S.reveal;
   app.innerHTML = `
@@ -617,9 +601,7 @@ function renderReveal() {
             <div class="combo ${c.isWinner ? 'winner' : ''}">
               <div class="combo-author">${escapeHtml(c.playerName)}</div>
               <div class="combo-memes">
-                ${c.memes.map(m => `
-                  <div class="combo-meme">${escapeHtml(m.title)}</div>
-                `).join('')}
+                ${c.memes.map(m => `<div class="combo-meme">${escapeHtml(m.title)}</div>`).join('')}
               </div>
               <div class="combo-actions">
                 <button class="ghost-btn ${isPlaying ? 'playing' : ''}"
@@ -638,10 +620,7 @@ function renderReveal() {
   `;
 }
 
-// ============================================================
-// Экран: финал
-// ============================================================
-
+// ---------- Финал ----------
 function renderGameOver() {
   const players = [...(S.gameOver?.players ?? [])].sort((a, b) => b.score - a.score);
   const [first, ...rest] = players;
@@ -669,18 +648,10 @@ function renderGameOver() {
 }
 
 // ============================================================
-// Экспорт функций в глобал для inline onclick
+// Экспорт
 // ============================================================
 
 Object.assign(window, {
-  createRoom,
-  joinRoom,
-  startGame,
-  leaveRoom,
-  pickPrompt,
-  toggleMeme,
-  submitCombo,
-  pickWinner,
-  playMeme,
-  playCombo,
+  createRoom, joinRoom, startGame, leaveRoom, pickPrompt,
+  toggleMeme, submitCombo, pickWinner, playMeme, playCombo,
 });

@@ -55,6 +55,7 @@ export function publicRoom(room) {
       id: p.id,
       name: p.name,
       score: p.score,
+      connected: p.connected !== false,   // soft disconnect: показываем статус
     })),
   };
 }
@@ -64,14 +65,20 @@ export function publicRoom(room) {
 // ============================================================
 
 export function startGame(room, io) {
-  if (room.players.length < DEFAULTS.MIN_PLAYERS) {
+  const connected = room.players.filter(p => p.connected !== false);
+
+  if (connected.length < DEFAULTS.MIN_PLAYERS) {
     throw new Error(`Нужно минимум ${DEFAULTS.MIN_PLAYERS} игрока`);
   }
-  if (MEMES_CACHE.length < DEFAULTS.HAND_SIZE * 2) {
-    throw new Error('Мало мемов в базе — не хватит на раздачу');
+  if (MEMES_CACHE.length < DEFAULTS.HAND_SIZE) {
+    throw new Error(
+      `Мало мемов: нужно минимум ${DEFAULTS.HAND_SIZE}, есть ${MEMES_CACHE.length}`
+    );
   }
   if (PROMPTS_CACHE.length < DEFAULTS.PROMPT_CHOICES) {
-    throw new Error('Мало заданий в базе — не хватит судье на выбор');
+    throw new Error(
+      `Мало заданий: нужно минимум ${DEFAULTS.PROMPT_CHOICES}, есть ${PROMPTS_CACHE.length}`
+    );
   }
 
   // Создаём запись партии в БД
@@ -81,7 +88,7 @@ export function startGame(room, io) {
   }
 
   room.roundNumber = 0;
-  log('game', `${room.code}: партия #${room.gameId} началась (${room.players.length} игроков)`);
+  log('game', `${room.code}: партия #${room.gameId} началась (${connected.length} игроков)`);
 
   startRound(room, io);
 }
@@ -93,13 +100,16 @@ export function startGame(room, io) {
 export function startRound(room, io) {
   room.roundNumber += 1;
 
-  // Судья — по кругу, начиная с первого
-  const judgeIdx = (room.roundNumber - 1) % room.players.length;
-  const judge = room.players[judgeIdx];
+  // Играют только подключённые
+  const active = room.players.filter(p => p.connected !== false);
 
-  // Раздача рук: всем, кроме судьи
+  // Судья — по кругу среди активных
+  const judgeIdx = (room.roundNumber - 1) % active.length;
+  const judge = active[judgeIdx];
+
+  // Раздача рук: всем активным, кроме судьи
   const hands = {};
-  for (const p of room.players) {
+  for (const p of active) {
     if (p.id === judge.id) continue;
     hands[p.id] = pickRandom(MEMES_CACHE, DEFAULTS.HAND_SIZE);
   }
@@ -112,26 +122,25 @@ export function startRound(room, io) {
     promptOptions,
     prompt: null,
     hands,
-    submissions: {},  // playerId → [memeId, memeId]
+    submissions: {},   // playerId → [memeId, memeId]
     winnerId: null,
   };
 
   setPhase(room, PHASES.JUDGE_PICKS_PROMPT);
 
-  // Всем: фаза + публичное состояние
   io.to(room.code).emit(EVENTS.PHASE_CHANGE, {
     phase: room.phase,
     roundNumber: room.roundNumber,
   });
   io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
 
-  // Судье: варианты заданий (приватно)
+  // Судье — варианты заданий
   io.to(judge.id).emit(EVENTS.SUBMISSIONS, {
     type: 'prompt_options',
     options: promptOptions,
   });
 
-  // Игрокам: их руки (приватно)
+  // Игрокам — их руки
   for (const [pid, hand] of Object.entries(hands)) {
     io.to(pid).emit(EVENTS.YOUR_HAND, { hand });
   }
@@ -177,7 +186,6 @@ export function submitCombo(room, socketId, memeIds, io) {
     return { ok: false, error: 'Ты уже отправил комбо' };
   }
 
-  // Валидация входных данных
   if (!Array.isArray(memeIds) || memeIds.length !== DEFAULTS.COMBO_SIZE) {
     return { ok: false, error: `Нужно ${DEFAULTS.COMBO_SIZE} мема` };
   }
@@ -194,10 +202,12 @@ export function submitCombo(room, socketId, memeIds, io) {
   room.round.submissions[socketId] = memeIds;
   touch(room);
 
+  // Ожидаем от всех активных, кроме судьи
+  const expected = room.players.filter(
+    p => p.connected !== false && p.id !== room.round.judgeId
+  ).length;
   const submitted = Object.keys(room.round.submissions).length;
-  const expected  = room.players.length - 1;
 
-  // Прогресс: сколько уже отправили
   io.to(room.code).emit(EVENTS.SCORE_UPDATE, {
     type: 'submission_progress',
     submitted,
@@ -206,7 +216,6 @@ export function submitCombo(room, socketId, memeIds, io) {
 
   log('game', `${room.code} R${room.roundNumber}: комбо ${submitted}/${expected}`);
 
-  // Все отправили — переходим к выбору победителя
   if (submitted >= expected) {
     moveToJudgePicks(room, io);
   }
@@ -216,7 +225,6 @@ export function submitCombo(room, socketId, memeIds, io) {
 function moveToJudgePicks(room, io) {
   setPhase(room, PHASES.JUDGE_PICKS_WINNER);
 
-  // Анонимные комбо для судьи
   const anonymous = Object.entries(room.round.submissions).map(([pid, ids]) => ({
     pid,
     memes: ids.map(id => MEMES_CACHE.find(m => m.id === id)).filter(Boolean),
@@ -243,16 +251,13 @@ export function pickWinner(room, socketId, winnerPid, io) {
 
   room.round.winnerId = winnerPid;
 
-  // Очки: победителю — 1000, судье — 500
   addScore(room, winnerPid, 1000);
   addScore(room, socketId, 500);
 
-  // Сохраняем раунд в БД
   saveRoundToDb(room);
 
   setPhase(room, PHASES.REVEAL);
 
-  // Раскрытие — всем
   const revealed = Object.entries(room.round.submissions).map(([pid, ids]) => {
     const player = room.players.find(p => p.id === pid);
     return {
@@ -273,7 +278,6 @@ export function pickWinner(room, socketId, winnerPid, io) {
   const winnerName = room.players.find(p => p.id === winnerPid)?.name ?? '???';
   log('game', `${room.code} R${room.roundNumber}: победил «${winnerName}»`);
 
-  // Через REVEAL_DELAY — следующий раунд или финал
   scheduleNextPhase(room, io);
 }
 
@@ -282,7 +286,6 @@ export function pickWinner(room, socketId, winnerPid, io) {
 // ============================================================
 
 function scheduleNextPhase(room, io) {
-  // Сбрасываем предыдущий таймер, если был
   if (room._revealTimer) {
     clearTimeout(room._revealTimer);
     room._revealTimer = null;
@@ -291,12 +294,17 @@ function scheduleNextPhase(room, io) {
   room._revealTimer = setTimeout(() => {
     room._revealTimer = null;
 
-    // Комнату могли удалить или все вышли
     if (!room.players.length) return;
 
-    // Партия длится ровно N раундов — каждый по разу судья
-    const totalRounds = room.players.length;
-    if (room.roundNumber >= totalRounds) {
+    const active = room.players.filter(p => p.connected !== false);
+    if (active.length < DEFAULTS.MIN_PLAYERS) {
+      // Игроков стало мало — завершаем партию
+      finishGame(room, io);
+      return;
+    }
+
+    // Партия длится N раундов — каждый по разу судья (среди активных)
+    if (room.roundNumber >= active.length) {
       finishGame(room, io);
     } else {
       startRound(room, io);
@@ -325,7 +333,8 @@ function finishGame(room, io) {
 
   io.to(room.code).emit(EVENTS.GAME_OVER, { players: finalScores });
 
-  log('game', `${room.code}: партия #${room.gameId} окончена, победитель «${finalScores[0]?.name}»`);
+  log('game',
+    `${room.code}: партия #${room.gameId} окончена, победитель «${finalScores[0]?.name}»`);
 }
 
 // ============================================================
@@ -358,7 +367,6 @@ function saveRoundToDb(room) {
       });
     }
 
-    // Свежие счета — в БД
     for (const p of room.players) {
       gamesRepo.savePlayer(room.gameId, p.name, p.score);
     }
@@ -372,11 +380,11 @@ function saveRoundToDb(room) {
 // ============================================================
 
 /**
- * Вызывается из index.js при disconnect, ЕСЛИ игра уже идёт.
- * Мягкая обработка: не роняем партию из-за одного ушедшего.
+ * Вызывается при ЯВНОМ выходе (кнопка) и при окончательном
+ * выпадении из игры (после grace-периода soft disconnect).
+ * Мягкая обработка: партия не падает из-за одного ушедшего.
  */
 export function handlePlayerLeave(room, socketId, io) {
-  // В лобби ничего особенного не делаем — rooms.js уже всё сделал
   if (!room.round || room.phase === PHASES.LOBBY || room.phase === PHASES.GAME_OVER) {
     return;
   }
@@ -391,9 +399,9 @@ export function handlePlayerLeave(room, socketId, io) {
   if (room.round.judgeId === socketId) {
     log('game', `${room.code}: судья вышел, прерываю раунд`);
 
-    if (room.players.length >= DEFAULTS.MIN_PLAYERS) {
-      // Не увеличиваем roundNumber — следующий startRound сам это сделает
-      // и выберет следующего судью по кругу
+    const active = room.players.filter(p => p.connected !== false);
+
+    if (active.length >= DEFAULTS.MIN_PLAYERS) {
       room.roundNumber -= 1;
       startRound(room, io);
     } else {
@@ -403,19 +411,19 @@ export function handlePlayerLeave(room, socketId, io) {
   }
 
   // --- Ушёл обычный игрок ---
-
-  // Убираем его комбо, если уже отправил
   delete room.round.submissions[socketId];
   delete room.round.hands[socketId];
 
-  // Если ждали отправок и все, кто остался, уже отправили — двигаемся дальше
+  // Если ждали отправок и все оставшиеся отправили — двигаемся дальше
   if (room.phase === PHASES.PLAYERS_SUBMIT) {
+    const expected = room.players.filter(
+      p => p.connected !== false && p.id !== room.round.judgeId
+    ).length;
     const submitted = Object.keys(room.round.submissions).length;
-    const expected  = room.players.length - 1;
+
     if (expected > 0 && submitted >= expected) {
       moveToJudgePicks(room, io);
     } else {
-      // Обновим прогресс у всех
       io.to(room.code).emit(EVENTS.SCORE_UPDATE, {
         type: 'submission_progress',
         submitted,
@@ -425,13 +433,11 @@ export function handlePlayerLeave(room, socketId, io) {
     return;
   }
 
-  // Если ждали выбора судьи и игроков осталось мало — пересчитываем
   if (room.phase === PHASES.JUDGE_PICKS_WINNER) {
-    // Просто оставляем как есть, судья выберет из оставшихся
+    // Судья уже выбирает из оставшихся — ничего не делаем
     return;
   }
 
-  // Если шло раскрытие — запланируем следующий раунд
   if (room.phase === PHASES.REVEAL) {
     scheduleNextPhase(room, io);
   }

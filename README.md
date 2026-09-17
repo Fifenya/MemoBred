@@ -32,4 +32,4 @@ pkg install nodejs git
 
 git clone <твой-репо> memobred
 cd memobred
-./start.sh# MemoBred
+./start.sh

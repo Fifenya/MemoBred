@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# МемоБред — универсальный запуск (Termux + Linux)
+# МемоБред — запуск сервера (Termux + Linux)
 # ============================================================
 
 set -e
@@ -26,19 +26,17 @@ EOF
   exit 1
 fi
 
-# ---------- Проверка версии (нужен >= 22.5 для node:sqlite) ----------
-NODE_VER_RAW=$(node -v)                # v26.4.0
+# ---------- Проверка версии (>= 22.5 для node:sqlite) ----------
+NODE_VER_RAW=$(node -v)
 NODE_MAJOR=$(echo "$NODE_VER_RAW" | sed 's/^v//' | cut -d. -f1)
 NODE_MINOR=$(echo "$NODE_VER_RAW" | sed 's/^v//' | cut -d. -f2)
 
 if [ "$NODE_MAJOR" -lt 22 ] || { [ "$NODE_MAJOR" -eq 22 ] && [ "$NODE_MINOR" -lt 5 ]; }; then
   cat <<EOF
-❌ Нужен Node.js >= 22.5 (для встроенного модуля node:sqlite).
+❌ Нужен Node.js >= 22.5 (для встроенного node:sqlite).
    Сейчас: $NODE_VER_RAW
 
    Termux:  pkg update && pkg upgrade && pkg install nodejs
-   Debian:  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-            sudo apt install nodejs
 EOF
   exit 1
 fi

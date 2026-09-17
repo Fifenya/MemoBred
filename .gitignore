@@ -8,14 +8,15 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 
+# Бэкапы
+backups/
+
 # MP3-мемы — большие, лицензии разные, не тянем в git
 memes/*.mp3
 memes/*.wav
 memes/*.ogg
 memes/*.m4a
-
-# Бэкапы
-backups/
+!memes/.gitkeep
 
 # Логи
 logs/
