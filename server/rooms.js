@@ -1,27 +1,29 @@
-import { generateCode, sanitizeName, log } from './utils.js';
+import { generateCode, sanitizeName, generateToken, log } from './utils.js';
 import { PHASES, DEFAULTS } from './events.js';
 
-const rooms = new Map();          // code → Room
-const socketToRoom = new Map();   // socketId → code
+const rooms = new Map();
+const socketToRoom = new Map();
 
 // ============================================================
-// Создание / вход / выход
+// Создание / вход
 // ============================================================
 
-export function createRoom(socketId, rawName, sessionId = null) {
+export function createRoom(socketId, rawName) {
   const name = sanitizeName(rawName) || 'Хост';
   const code = generateCode(c => rooms.has(c));
+  const token = generateToken();
 
   const room = {
     code,
     hostId: socketId,
+    hostToken: token,
     phase: PHASES.LOBBY,
     roundNumber: 0,
     gameId: null,
     round: null,
     players: [{
       id: socketId,
-      sessionId: sessionId || socketId,
+      token,
       name,
       score: 0,
       connected: true,
@@ -38,7 +40,7 @@ export function createRoom(socketId, rawName, sessionId = null) {
   return room;
 }
 
-export function joinRoom(rawCode, socketId, rawName, sessionId = null) {
+export function joinRoom(rawCode, socketId, rawName) {
   const code = String(rawCode || '').toUpperCase().trim();
   const room = rooms.get(code);
 
@@ -50,10 +52,11 @@ export function joinRoom(rawCode, socketId, rawName, sessionId = null) {
 
   const name = sanitizeName(rawName) || `Игрок ${room.players.length + 1}`;
   const finalName = uniqueName(room, name);
+  const token = generateToken();
 
   room.players.push({
     id: socketId,
-    sessionId: sessionId || socketId,
+    token,
     name: finalName,
     score: 0,
     connected: true,
@@ -64,11 +67,11 @@ export function joinRoom(rawCode, socketId, rawName, sessionId = null) {
   touch(room);
 
   log('room', `«${finalName}» вошёл в ${code} (${room.players.length} игроков)`);
-  return { ok: true, room };
+  return { ok: true, room, token };
 }
 
 // ============================================================
-// SOFT DISCONNECT — не удаляем игрока, только помечаем
+// SOFT DISCONNECT
 // ============================================================
 
 export function markDisconnected(socketId) {
@@ -84,14 +87,10 @@ export function markDisconnected(socketId) {
   player.connected = false;
   player.disconnectedAt = Date.now();
   touch(room);
-
   log('room', `${code}: «${player.name}» отключился (grace ${DEFAULTS.DISCONNECT_GRACE / 1000}s)`);
   return room;
 }
 
-/**
- * Явный выход (кнопка «Выйти»). Удаляем сразу, без grace.
- */
 export function leaveRoom(socketId) {
   const code = socketToRoom.get(socketId);
   if (!code) return null;
@@ -112,6 +111,7 @@ export function leaveRoom(socketId) {
 
   if (room.hostId === socketId) {
     room.hostId = room.players[0].id;
+    room.hostToken = room.players[0].token;
     log('room', `${code}: хост передан «${room.players[0].name}»`);
   }
 
@@ -121,32 +121,43 @@ export function leaveRoom(socketId) {
 }
 
 // ============================================================
-// REJOIN — восстановление по sessionId
+// REJOIN по токену
 // ============================================================
 
-export function findBySession(sessionId) {
-  if (!sessionId) return null;
+export function findByToken(token) {
+  if (!token) return null;
   for (const room of rooms.values()) {
-    const player = room.players.find(p => p.sessionId === sessionId);
+    const player = room.players.find(p => p.token === token);
     if (player) return { room, player };
   }
   return null;
 }
 
 export function restorePlayer(room, player, newSocketId) {
-  // Если старый сокет висел в маппинге — чистим
-  if (player.id !== newSocketId) {
-    socketToRoom.delete(player.id);
+  const oldId = player.id;
+
+  if (oldId && oldId !== newSocketId) socketToRoom.delete(oldId);
+
+  // Мигрируем руку и комбо на новый socket.id
+  if (room.round) {
+    if (room.round.hands?.[oldId]) {
+      room.round.hands[newSocketId] = room.round.hands[oldId];
+      delete room.round.hands[oldId];
+    }
+    if (room.round.submissions?.[oldId]) {
+      room.round.submissions[newSocketId] = room.round.submissions[oldId];
+      delete room.round.submissions[oldId];
+    }
+    if (room.round.judgeId === oldId) room.round.judgeId = newSocketId;
   }
+
   player.id = newSocketId;
   player.connected = true;
   player.disconnectedAt = null;
   socketToRoom.set(newSocketId, room.code);
 
-  // Если хост вернулся, а его уже перекинули — возвращаем
-  if (room.players.length && !room.players.some(p => p.connected && p.id === room.hostId)) {
-    room.hostId = newSocketId;
-  }
+  // Хост вернулся — возвращаем роль
+  if (room.hostToken === player.token) room.hostId = newSocketId;
 
   touch(room);
   log('room', `${room.code}: «${player.name}» вернулся`);
@@ -178,17 +189,11 @@ export function isJudge(room, socketId) {
   return room.round?.judgeId === socketId;
 }
 
-export function getPlayerBySession(room, sessionId) {
-  return room.players.find(p => p.sessionId === sessionId) ?? null;
-}
-
 // ============================================================
 // Мутации
 // ============================================================
 
-export function touch(room) {
-  room.lastActivityAt = Date.now();
-}
+export function touch(room) { room.lastActivityAt = Date.now(); }
 
 export function addScore(room, socketId, points) {
   const p = getPlayer(room, socketId);
@@ -205,14 +210,10 @@ export function setPhase(room, phase) {
 // Очистка
 // ============================================================
 
-/**
- * Удаляет давно отключённых игроков и мёртвые комнаты.
- * Вызывается по таймеру из index.js раз в 10 секунд.
- */
 export function cleanupDisconnectedPlayers() {
   const now = Date.now();
   const grace = DEFAULTS.DISCONNECT_GRACE;
-  let changed = [];
+  const changed = [];
 
   for (const [code, room] of rooms) {
     const before = room.players.length;
@@ -223,7 +224,6 @@ export function cleanupDisconnectedPlayers() {
 
     if (room.players.length === before) continue;
 
-    // Кто-то выпал окончательно
     if (room.players.length === 0) {
       rooms.delete(code);
       log('room', `${code} удалена (все отключились)`);
@@ -231,24 +231,20 @@ export function cleanupDisconnectedPlayers() {
       continue;
     }
 
-    // Хост ушёл окончательно — передаём следующему
     const hostAlive = room.players.find(p => p.id === room.hostId && p.connected);
     if (!hostAlive) {
       const next = room.players.find(p => p.connected) || room.players[0];
       room.hostId = next.id;
+      room.hostToken = next.token;
       log('room', `${code}: хост передан «${next.name}»`);
     }
 
     touch(room);
     changed.push(room);
   }
-
   return changed;
 }
 
-/**
- * Удаляет комнаты, где никого нет ИЛИ давно не было активности.
- */
 export function cleanupStaleRooms() {
   const now = Date.now();
   const ttl = DEFAULTS.ROOM_TTL;
@@ -263,18 +259,12 @@ export function cleanupStaleRooms() {
       removed++;
     }
   }
-
   if (removed > 0) log('room', `Очистка: удалено ${removed}`);
   return removed;
 }
 
-// ============================================================
-// Диагностика
-// ============================================================
-
 export function stats() {
-  let totalPlayers = 0;
-  let connected = 0;
+  let totalPlayers = 0, connected = 0;
   for (const room of rooms.values()) {
     totalPlayers += room.players.length;
     connected += room.players.filter(p => p.connected).length;
@@ -282,16 +272,12 @@ export function stats() {
   return { rooms: rooms.size, players: totalPlayers, connected };
 }
 
-// ============================================================
-// Хелпер
-// ============================================================
-
 function uniqueName(room, base) {
   const taken = new Set(room.players.map(p => p.name));
   if (!taken.has(base)) return base;
   for (let i = 2; i < 100; i++) {
-    const candidate = `${base} ${i}`;
-    if (!taken.has(candidate)) return candidate;
+    const c = `${base} ${i}`;
+    if (!taken.has(c)) return c;
   }
   return `${base} ${Date.now() % 1000}`;
 }

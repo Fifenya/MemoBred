@@ -10,11 +10,14 @@ import { EVENTS, PHASES, DEFAULTS } from './events.js';
 import { log } from './utils.js';
 import { closeDb, memesRepo, promptsRepo } from './db.js';
 import { seedIfEmpty } from './seed.js';
-import { reloadPools, getMemesCount, getPromptsCount } from './game.js';
+import {
+  publicRoom, startGame, pickPrompt, submitCombo,
+  pickWinner, handlePlayerLeave, playerView,
+} from './game.js';
 import {
   createRoom, joinRoom, leaveRoom,
   getRoomBySocket, getRoomByCode, isHost,
-  findBySession, restorePlayer,
+  findByToken, restorePlayer,
   markDisconnected, cleanupDisconnectedPlayers, cleanupStaleRooms,
   stats,
 } from './rooms.js';
@@ -94,58 +97,58 @@ io.on('connection', (socket) => {
   log('sock', `+ ${socket.id.slice(0, 6)}`);
 
   // ---------- Создание комнаты ----------
-  socket.on(EVENTS.CREATE_ROOM, ({ name, sessionId } = {}, cb) => {
-    try {
-      const room = createRoom(socket.id, name, sessionId);
-      socket.join(room.code);
-      cb?.({ ok: true, youId: socket.id, room: publicRoom(room) });
-      io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
-    } catch (e) {
-      log('sock', 'create_room error:', e.message);
-      cb?.({ ok: false, error: 'Не удалось создать комнату' });
-    }
-  });
-
-  // ---------- Вход в комнату ----------
-  socket.on(EVENTS.JOIN_ROOM, ({ code, name, sessionId } = {}, cb) => {
-    const result = joinRoom(code, socket.id, name, sessionId);
-    if (!result.ok) return cb?.({ ok: false, error: result.error });
-
-    const room = result.room;
+socket.on(EVENTS.CREATE_ROOM, ({ name } = {}, cb) => {
+  try {
+    const room = createRoom(socket.id, name);
     socket.join(room.code);
-    cb?.({ ok: true, youId: socket.id, room: publicRoom(room) });
+    const token = room.players[0].token;
+
+    cb?.({ ok: true, youId: socket.id, token, room: publicRoom(room) });
     io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
+  } catch (e) {
+    log('sock', 'create_room error:', e.message);
+    cb?.({ ok: false, error: 'Не удалось создать комнату' });
+  }
+});
+
+// ---------- Вход в комнату ----------
+socket.on(EVENTS.JOIN_ROOM, ({ code, name } = {}, cb) => {
+  const result = joinRoom(code, socket.id, name);
+  if (!result.ok) return cb?.({ ok: false, error: result.error });
+
+  const { room, token } = result;
+  socket.join(room.code);
+  cb?.({ ok: true, youId: socket.id, token, room: publicRoom(room) });
+  io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
+});
+
+// ---------- REJOIN ----------
+socket.on(EVENTS.REJOIN, ({ token } = {}, cb) => {
+  const found = findByToken(token);
+  if (!found) return cb?.({ ok: false, error: 'Сессия истекла' });
+
+  const { room, player } = found;
+  restorePlayer(room, player, socket.id);
+  socket.join(room.code);
+
+  // Полное состояние игрока — включая hand, submitted, combos
+  const view = playerView(room, socket.id);
+
+  cb?.({
+    ok: true,
+    youId: socket.id,
+    room: publicRoom(room),
+    ...view,
   });
 
-  // ---------- REJOIN после reconnect ----------
-  socket.on(EVENTS.REJOIN, ({ sessionId, code } = {}, cb) => {
-    const found = findBySession(sessionId);
-    if (!found) {
-      return cb?.({ ok: false, error: 'Сессия истекла' });
-    }
-    const { room, player } = found;
-    if (code && room.code !== String(code).toUpperCase()) {
-      return cb?.({ ok: false, error: 'Код не совпадает' });
-    }
+  io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
 
-    restorePlayer(room, player, socket.id);
-    socket.join(room.code);
-
-    // Приватное состояние — то, что игрок должен видеть
-    const hand = room.round?.hands?.[socket.id] ?? null;
-    const isJudgeNow = room.round?.judgeId === socket.id;
-    const promptOptions = isJudgeNow ? room.round.promptOptions : null;
-
-    cb?.({
-      ok: true,
-      youId: socket.id,
-      room: publicRoom(room),
-      hand,
-      promptOptions,
-    });
-
-    io.to(room.code).emit(EVENTS.ROOM_STATE, publicRoom(room));
-  });
+  // Если идёт таймер — досылаем его текущее значение
+  if (room.round?.timerEnd) {
+    const remaining = Math.max(0, room.round.timerEnd - Date.now());
+    socket.emit(EVENTS.TIMER_TICK, { remaining });
+  }
+});
 
   // ---------- Явный выход ----------
   socket.on(EVENTS.LEAVE_ROOM, () => {

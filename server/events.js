@@ -1,9 +1,4 @@
-// ============================================================
-// Общий контракт клиент ↔ сервер
-// ============================================================
-
 export const EVENTS = {
-  // клиент → сервер
   CREATE_ROOM:   'create_room',
   JOIN_ROOM:     'join_room',
   REJOIN:        'rejoin',
@@ -13,7 +8,6 @@ export const EVENTS = {
   PICK_WINNER:   'pick_winner',
   LEAVE_ROOM:    'leave_room',
 
-  // сервер → клиент
   ROOM_STATE:    'room_state',
   YOUR_HAND:     'your_hand',
   PHASE_CHANGE:  'phase_change',
@@ -21,6 +15,7 @@ export const EVENTS = {
   REVEAL:        'reveal',
   SCORE_UPDATE:  'score_update',
   GAME_OVER:     'game_over',
+  TIMER_TICK:    'timer_tick',
   ERROR:         'error',
 };
 
@@ -34,12 +29,18 @@ export const PHASES = {
 };
 
 export const DEFAULTS = {
-  MIN_PLAYERS:       2,        // ← было 3
+  MIN_PLAYERS:       2,
   MAX_PLAYERS:       10,
   HAND_SIZE:         7,
   COMBO_SIZE:        2,
   PROMPT_CHOICES:    3,
-  REVEAL_DELAY:      6000,
+  REVEAL_DELAY:      8000,     // 8 сек на показ раскрытия
   ROOM_TTL:          3600_000,
   DISCONNECT_GRACE:  60_000,
+};
+
+export const DURATIONS = {
+  JUDGE_PICKS_PROMPT: 30_000,   // 30 сек на выбор задания
+  PLAYERS_SUBMIT:     90_000,   // 90 сек на выбор комбо
+  JUDGE_PICKS_WINNER: 30_000,   // 30 сек на выбор победителя
 };

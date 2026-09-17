@@ -74,3 +74,9 @@ export function log(tag, ...args) {
   const t = new Date().toISOString().slice(11, 19);
   console.log(`[${t}] [${tag}]`, ...args);
 }
+
+import { randomUUID } from 'node:crypto';
+
+export function generateToken() {
+  return randomUUID();
+}

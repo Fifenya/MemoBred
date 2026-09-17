@@ -5,9 +5,10 @@
   "type": "module",
   "main": "server/index.js",
   "scripts": {
-    "start": "node server/index.js",
-    "dev": "node --watch server/index.js",
-    "seed": "node server/seed.js --force",
+    "start":  "node server/index.js",
+    "dev":    "node --watch server/index.js",
+    "seed":   "node server/seed.js --force",
+    "tunnel": "bash tunnel.sh",
     "backup": "bash scripts/backup.sh"
   },
   "dependencies": {

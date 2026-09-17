@@ -554,3 +554,46 @@ button.ghost {
   .play-btn { min-width: 44px; }
   .meme-row { grid-template-columns: 44px 1fr; }
 }
+
+.player.offline { opacity: 0.5; }
+.player.offline em {
+  color: var(--muted);
+  font-style: normal;
+  font-size: 12px;
+}
+
+/* ============================================================
+   Таймер
+   ============================================================ */
+
+.timer {
+  display: inline-block;
+  align-self: center;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 6px 16px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--muted);
+  font-family: 'Courier New', monospace;
+  margin: 0 auto;
+  transition: all 0.2s;
+}
+.timer.urgent {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  animation: pulse 0.8s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.06); }
+}
+
+.player.offline { opacity: 0.5; }
+.player.offline em {
+  color: var(--muted);
+  font-style: normal;
+  font-size: 12px;
+}

@@ -1,6 +1,6 @@
 /* ============================================================
-   МемоБред — клиент с авто-восстановлением сессии.
-   sessionStorage — свой у каждой вкладки (не пересекаются).
+   МемоБред — клиент.
+   playerToken в sessionStorage — уникален для каждой вкладки.
    ============================================================ */
 
 const socket = io({
@@ -9,26 +9,17 @@ const socket = io({
   reconnectionDelayMax: 5000,
 });
 
-// ---------- Сессия в sessionStorage ----------
-const SESSION_KEY = 'memobred_session';
-const ROOM_KEY    = 'memobred_room';
-
-function getSessionId() {
-  let sid = sessionStorage.getItem(SESSION_KEY);
-  if (!sid) {
-    sid = (crypto?.randomUUID?.() || (Date.now() + '-' + Math.random().toString(36).slice(2)));
-    sessionStorage.setItem(SESSION_KEY, sid);
-  }
-  return sid;
-}
-
-const SESSION_ID = getSessionId();
+const TOKEN_KEY = 'memobred_token';
+const getMyToken   = () => sessionStorage.getItem(TOKEN_KEY);
+const setMyToken   = (t) => sessionStorage.setItem(TOKEN_KEY, t);
+const clearMyToken = () => sessionStorage.removeItem(TOKEN_KEY);
 
 // ---------- Состояние ----------
 const S = {
   connected: false,
   reconnecting: false,
   youId: null,
+  myToken: null,
   room: null,
   hand: [],
   promptOptions: [],
@@ -37,14 +28,18 @@ const S = {
   reveal: null,
   gameOver: null,
   progress: null,
+  submitted: false,          // уже отправил в этом раунде?
+  submittedCombo: null,      // какие мемы отправил (для показа)
+  timerEnd: null,
+  timerRemaining: 0,
   selected: [],
   toast: null,
 };
 
 const app = document.getElementById('app');
 let toastTimer = null;
+let timerInterval = null;
 
-// Сброс всего игрового состояния (кроме sessionId)
 function resetGameState() {
   S.room = null;
   S.hand = [];
@@ -54,8 +49,32 @@ function resetGameState() {
   S.reveal = null;
   S.gameOver = null;
   S.progress = null;
+  S.submitted = false;
+  S.submittedCombo = null;
+  S.timerEnd = null;
+  S.timerRemaining = 0;
   S.selected = [];
   audio.stop();
+  stopTimer();
+}
+
+function isMe(player) {
+  return player?.token && player.token === S.myToken;
+}
+
+// ---------- Таймер ----------
+function stopTimer() {
+  if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+}
+
+function runTimer() {
+  stopTimer();
+  timerInterval = setInterval(() => {
+    if (!S.timerEnd) return;
+    S.timerRemaining = Math.max(0, S.timerEnd - Date.now());
+    // Перерисовываем только если мы в игровой фазе с таймером
+    if (S.room && S.timerRemaining !== null) render();
+  }, 500);
 }
 
 // ============================================================
@@ -150,41 +169,50 @@ function showToast(text) {
   render();
 }
 
+function formatTimer(ms) {
+  if (!ms || ms <= 0) return '';
+  const sec = Math.ceil(ms / 1000);
+  return `${sec}`;
+}
+
 // ============================================================
-// Socket — входящие
+// Socket
 // ============================================================
 
 socket.on('connect', () => {
   S.connected = true;
   S.youId = socket.id;
 
-  const savedRoom = sessionStorage.getItem(ROOM_KEY);
-
-  // Нет сохранённой сессии — сразу показываем главный
-  if (!savedRoom) {
+  const token = getMyToken();
+  if (!token) {
     S.reconnecting = false;
     render();
     return;
   }
 
-  // Есть — пытаемся восстановиться
+  S.myToken = token;
   S.reconnecting = true;
   render();
 
-  socket.emit('rejoin', { sessionId: SESSION_ID, code: savedRoom }, (res) => {
+  socket.emit('rejoin', { token }, (res) => {
     S.reconnecting = false;
 
     if (res?.ok) {
       S.youId = res.youId;
       S.room = res.room;
-      if (res.hand) S.hand = res.hand;
-      if (res.promptOptions) S.promptOptions = res.promptOptions;
+      S.hand = res.hand ?? [];
+      S.promptOptions = res.promptOptions ?? [];
+      S.combos = res.combos ?? [];
+      S.submitted = !!res.submitted;
+      S.submittedCombo = res.submittedCombo ?? null;
+      S.timerEnd = res.room?.timerEnd ?? null;
+      if (S.timerEnd) runTimer();
       render();
       return;
     }
 
-    // --- ВОТ ФИКС: сбрасываем ВСЁ, а не только sessionStorage ---
-    sessionStorage.removeItem(ROOM_KEY);
+    clearMyToken();
+    S.myToken = null;
     resetGameState();
     render();
   });
@@ -192,33 +220,55 @@ socket.on('connect', () => {
 
 socket.on('disconnect', () => {
   S.connected = false;
-  // S.room НЕ трогаем — вдруг reconnect вернёт нас в ту же комнату
   render();
 });
 
 socket.on('room_state', (room) => {
   if (room.phase === 'lobby' && S.room?.phase && S.room.phase !== 'lobby') {
     audio.stop();
+    stopTimer();
   }
   S.room = room;
+
+  if (room.timerEnd) {
+    S.timerEnd = room.timerEnd;
+    if (!timerInterval) runTimer();
+  } else {
+    S.timerEnd = null;
+    S.timerRemaining = 0;
+    stopTimer();
+  }
 
   if (room.phase === 'lobby') {
     S.hand = []; S.combos = []; S.reveal = null; S.gameOver = null;
     S.promptOptions = []; S.prompt = null; S.selected = []; S.progress = null;
+    S.submitted = false; S.submittedCombo = null;
   }
   render();
 });
 
 socket.on('phase_change', (data) => {
   audio.stop();
-  S.prompt = data.prompt ?? null;
+  stopTimer();
+  // НЕ затираем prompt, если его не прислали
+  if (data.prompt !== undefined) S.prompt = data.prompt;
   S.selected = [];
+  S.submitted = false;
+  S.submittedCombo = null;
 
-  if (data.phase === 'judge_picks_prompt') S.promptOptions = [];
-  if (data.phase !== 'reveal') S.reveal = null;
-  if (data.phase === 'players_submit') {
-    S.progress = { submitted: 0, expected: Math.max(0, (S.room?.players.length ?? 1) - 1) };
+  if (data.phase === 'judge_picks_prompt') {
+    S.promptOptions = [];
+    S.prompt = null;
   }
+  if (data.phase === 'players_submit') {
+    S.progress = {
+      submitted: 0,
+      expected: Math.max(0, (S.room?.players.filter(p => p.connected !== false).length ?? 1) - 1),
+    };
+  }
+  if (data.phase !== 'reveal') S.reveal = null;
+  if (data.phase !== 'judge_picks_winner') S.combos = [];
+
   render();
 });
 
@@ -241,16 +291,22 @@ socket.on('score_update', (data) => {
   render();
 });
 
+socket.on('timer_tick', ({ remaining }) => {
+  S.timerRemaining = remaining;
+  S.timerEnd = Date.now() + remaining;
+  render();
+});
+
 socket.on('reveal', (data) => {
   S.reveal = data;
-  S.prompt = data.prompt ?? S.prompt;
+  if (data.prompt) S.prompt = data.prompt;
   render();
 });
 
 socket.on('game_over', (data) => {
   audio.stop();
+  stopTimer();
   S.gameOver = data;
-  sessionStorage.removeItem(ROOM_KEY);
   render();
 });
 
@@ -266,11 +322,12 @@ function createRoom() {
   const name = ($('name-input')?.value || '').trim();
   if (!name) return showToast('Введи имя');
 
-  socket.emit('create_room', { name, sessionId: SESSION_ID }, (res) => {
+  socket.emit('create_room', { name }, (res) => {
     if (!res?.ok) return showToast(res?.error || 'Ошибка');
     S.youId = res.youId;
+    S.myToken = res.token;
+    setMyToken(res.token);
     S.room = res.room;
-    sessionStorage.setItem(ROOM_KEY, res.room.code);
     render();
   });
 }
@@ -281,11 +338,12 @@ function joinRoom() {
   if (!name) return showToast('Введи имя');
   if (code.length !== 4) return showToast('Код — 4 буквы');
 
-  socket.emit('join_room', { name, code, sessionId: SESSION_ID }, (res) => {
+  socket.emit('join_room', { name, code }, (res) => {
     if (!res?.ok) return showToast(res?.error || 'Ошибка');
     S.youId = res.youId;
+    S.myToken = res.token;
+    setMyToken(res.token);
     S.room = res.room;
-    sessionStorage.setItem(ROOM_KEY, res.room.code);
     render();
   });
 }
@@ -294,7 +352,8 @@ function startGame() { socket.emit('start_game'); }
 
 function leaveRoom() {
   socket.emit('leave_room');
-  sessionStorage.removeItem(ROOM_KEY);
+  clearMyToken();
+  S.myToken = null;
   resetGameState();
   render();
 }
@@ -302,6 +361,7 @@ function leaveRoom() {
 function pickPrompt(promptId) { socket.emit('pick_prompt', { promptId }); }
 
 function toggleMeme(memeId) {
+  if (S.submitted) return;
   const idx = S.selected.indexOf(memeId);
   if (idx >= 0) S.selected.splice(idx, 1);
   else if (S.selected.length < 2) S.selected.push(memeId);
@@ -310,9 +370,14 @@ function toggleMeme(memeId) {
 }
 
 function submitCombo() {
-  if (S.selected.length !== 2) return;
-  socket.emit('submit_combo', { memeIds: S.selected }, (res) => {
+  if (S.selected.length !== 2 || S.submitted) return;
+
+  const memesToSend = [...S.selected];
+  socket.emit('submit_combo', { memeIds: memesToSend }, (res) => {
     if (!res?.ok) return showToast(res?.error || 'Ошибка');
+    // Запоминаем что отправил — показываем экран ожидания
+    S.submitted = true;
+    S.submittedCombo = S.hand.filter(m => memesToSend.includes(m.id));
     S.selected = [];
     render();
   });
@@ -332,20 +397,17 @@ function playCombo(memes) { audio.playSequence(memes); }
 // ============================================================
 
 function render() {
-  // Нет соединения
   if (!S.connected) {
     app.innerHTML = `
       <div class="screen center">
         <h1 class="logo">🎵 МемоБред</h1>
         <p class="subtitle">Подключение…</p>
         <div class="spinner"></div>
-        ${S.room?.code ? `<p class="hint">Восстанавливаю комнату ${escapeHtml(S.room.code)}</p>` : ''}
       </div>
     `;
     return;
   }
 
-  // Идёт восстановление
   if (S.reconnecting) {
     app.innerHTML = `
       <div class="screen center">
@@ -370,6 +432,13 @@ function render() {
   }
 }
 
+function timerBadge() {
+  if (!S.timerEnd || S.timerRemaining <= 0) return '';
+  const sec = Math.ceil(S.timerRemaining / 1000);
+  const cls = sec <= 5 ? 'timer urgent' : 'timer';
+  return `<div class="${cls}">⏱ ${sec}</div>`;
+}
+
 // ---------- Главный ----------
 function renderMain() {
   app.innerHTML = `
@@ -388,7 +457,7 @@ function renderMain() {
         <button class="secondary" onclick="joinRoom()">Войти по коду</button>
       </div>
 
-      <p class="hint">Для партии нужно 3+ игрока.</p>
+      <p class="hint">Для партии нужно 2+ игрока.</p>
 
       ${S.toast ? `<div class="toast">${escapeHtml(S.toast)}</div>` : ''}
     </div>
@@ -402,10 +471,11 @@ function renderMain() {
 // ---------- Лобби ----------
 function renderLobby() {
   const r = S.room;
-  const isHost = r.hostId === S.youId;
-  const count = r.players.length;
-  const canStart = isHost && count >= 3;
-  const need = Math.max(0, 3 - count);
+  const me = r.players.find(p => isMe(p));
+  const isHost = me && me.token === r.hostToken;
+  const count = r.players.filter(p => p.connected !== false).length;
+  const canStart = isHost && count >= 2;
+  const need = Math.max(0, 2 - count);
 
   app.innerHTML = `
     <div class="screen center">
@@ -415,9 +485,9 @@ function renderLobby() {
 
       <div class="players">
         ${r.players.map(p => `
-          <div class="player ${p.id === S.youId ? 'you' : ''}">
-            <span>${escapeHtml(p.name)}</span>
-            ${p.id === r.hostId ? '<span class="badge">хост</span>' : ''}
+          <div class="player ${isMe(p) ? 'you' : ''} ${p.connected === false ? 'offline' : ''}">
+            <span>${escapeHtml(p.name)}${p.connected === false ? ' <em>(отошёл)</em>' : ''}</span>
+            ${p.token === r.hostToken ? '<span class="badge">хост</span>' : ''}
           </div>
         `).join('')}
       </div>
@@ -443,6 +513,7 @@ function renderJudgePicksPrompt() {
   if (!isJudge) {
     app.innerHTML = `
       <div class="screen center">
+        ${timerBadge()}
         <h2>Раунд ${r.roundNumber}</h2>
         <p class="subtitle">Судья выбирает задание…</p>
         <div class="spinner"></div>
@@ -453,6 +524,7 @@ function renderJudgePicksPrompt() {
 
   app.innerHTML = `
     <div class="screen">
+      ${timerBadge()}
       <h2>Ты — судья</h2>
       <p class="subtitle">Выбери задание для этого раунда</p>
 
@@ -476,11 +548,12 @@ function renderPlayersSubmit() {
 
   if (isJudge) {
     const sub = S.progress?.submitted ?? 0;
-    const exp = S.progress?.expected ?? Math.max(0, r.players.length - 1);
+    const exp = S.progress?.expected ?? Math.max(0, r.players.filter(p => p.connected !== false).length - 1);
     const pct = exp ? Math.round((sub / exp) * 100) : 0;
 
     app.innerHTML = `
       <div class="screen center">
+        ${timerBadge()}
         <h2>Ты — судья</h2>
         <div class="prompt-display">${escapeHtml(S.prompt?.text || '')}</div>
         <p class="subtitle">Ждём комбо от игроков…</p>
@@ -494,11 +567,42 @@ function renderPlayersSubmit() {
     return;
   }
 
+  // Уже отправил — показываем ожидание
+  if (S.submitted) {
+    const sub = S.progress?.submitted ?? 1;
+    const exp = S.progress?.expected ?? 1;
+    const pct = exp ? Math.round((sub / exp) * 100) : 0;
+
+    app.innerHTML = `
+      <div class="screen">
+        ${timerBadge()}
+        <div class="prompt-display">${escapeHtml(S.prompt?.text || '')}</div>
+
+        <h2 style="color: var(--accent); margin-top: 8px">✓ Отправлено</h2>
+        <p class="subtitle">Твоё комбо:</p>
+
+        <div class="combo-memes" style="margin: 8px 0 16px">
+          ${(S.submittedCombo ?? []).map(m => `
+            <div class="combo-meme">${escapeHtml(m.title)}</div>
+          `).join('')}
+        </div>
+
+        <div class="progress-bar">
+          <div class="progress-bar-fill" style="width:${pct}%"></div>
+        </div>
+        <p class="counter">Ждём остальных: ${sub} / ${exp}</p>
+      </div>
+    `;
+    return;
+  }
+
+  // Обычный выбор
   const need = 2 - S.selected.length;
   const ready = S.selected.length === 2;
 
   app.innerHTML = `
     <div class="screen">
+      ${timerBadge()}
       <div class="prompt-display">${escapeHtml(S.prompt?.text || '')}</div>
       <p class="counter ${ready ? 'ready' : ''}">
         ${ready ? 'Готово — отправляй' : `Выбери ещё ${need}`}
@@ -539,6 +643,7 @@ function renderJudgePicksWinner() {
   if (!isJudge) {
     app.innerHTML = `
       <div class="screen center">
+        ${timerBadge()}
         <div class="prompt-display">${escapeHtml(S.prompt?.text || '')}</div>
         <h2>Судья выбирает…</h2>
         <div class="spinner"></div>
@@ -549,6 +654,7 @@ function renderJudgePicksWinner() {
 
   app.innerHTML = `
     <div class="screen">
+      ${timerBadge()}
       <div class="prompt-display">${escapeHtml(S.prompt?.text || '')}</div>
       <p class="subtitle">Послушай и выбери лучшее комбо</p>
 
