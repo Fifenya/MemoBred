@@ -1,6 +1,6 @@
 /* ============================================================
    МемоБред — клиент v0.2
-   + Плееры, точечное обновление таймера и прогресса
+   Точечные обновления таймера и прогресса (без мигания)
    ============================================================ */
 
 const socket = io({
@@ -156,12 +156,12 @@ function runTimer() {
   timerInterval = setInterval(() => {
     if (!S.timerEnd) return;
     S.timerRemaining = Math.max(0, S.timerEnd - Date.now());
-    updateTimerUI();       // ← точечно, без render()
+    updateTimerUI();
   }, 500);
 }
 
 // ============================================================
-// Точечные обновления DOM (без перерисовки всего экрана)
+// Точечные обновления DOM
 // ============================================================
 
 function updateTimerUI() {
@@ -198,6 +198,34 @@ function updateProgressUI() {
       el.textContent = `${submitted} / ${expected}`;
     }
   });
+}
+
+function updateHandUI() {
+  const rows = document.querySelectorAll('.meme-row');
+  if (!rows.length) return;
+
+  S.hand.forEach((m, i) => {
+    const row = rows[i];
+    if (!row) return;
+    if (S.selected.includes(m.id)) row.classList.add('selected');
+    else row.classList.remove('selected');
+  });
+
+  const need = 2 - S.selected.length;
+  const ready = S.selected.length === 2;
+
+  document.querySelectorAll('.counter').forEach(el => {
+    const t = el.textContent.trim();
+    if (t.startsWith('Выбери ещё') || t.startsWith('Готово')) {
+      el.textContent = ready ? 'Готово — отправляй' : `Выбери ещё ${need}`;
+      el.classList.toggle('ready', ready);
+    }
+  });
+
+  const submit = document.querySelector('button.primary');
+  if (submit && submit.textContent.includes('Отправить')) {
+    submit.disabled = !ready;
+  }
 }
 
 // ============================================================
@@ -509,7 +537,6 @@ socket.on('submissions', (data) => {
   render();
 });
 
-// Прогресс отправок — точечно, без перерисовки (чтобы не сбрасывать скролл)
 socket.on('score_update', (data) => {
   if (data.type === 'submission_progress') {
     S.progress = { submitted: data.submitted, expected: data.expected };
@@ -517,7 +544,6 @@ socket.on('score_update', (data) => {
   }
 });
 
-// Тик таймера — точечно
 socket.on('timer_tick', ({ remaining }) => {
   S.timerRemaining = remaining;
   S.timerEnd = Date.now() + remaining;
@@ -652,37 +678,7 @@ function toggleMeme(memeId) {
   else if (S.selected.length < 2) S.selected.push(memeId);
   else showToast('Максимум 2 мема');
 
-  // Точечное обновление: переключаем класс и текст, не пересоздаём DOM
   updateHandUI();
-}
-
-// Точечное обновление руки (без перерисовки экрана — сохраняет скролл)
-function updateHandUI() {
-  const rows = document.querySelectorAll('.meme-row');
-  if (!rows.length) return;
-
-  S.hand.forEach((m, i) => {
-    const row = rows[i];
-    if (!row) return;
-    if (S.selected.includes(m.id)) row.classList.add('selected');
-    else row.classList.remove('selected');
-  });
-
-  const need = 2 - S.selected.length;
-  const ready = S.selected.length === 2;
-
-  document.querySelectorAll('.counter').forEach(el => {
-    const t = el.textContent.trim();
-    if (t.startsWith('Выбери ещё') || t.startsWith('Готово')) {
-      el.textContent = ready ? 'Готово — отправляй' : `Выбери ещё ${need}`;
-      el.classList.toggle('ready', ready);
-    }
-  });
-
-  const submit = document.querySelector('button.primary');
-  if (submit && submit.textContent.includes('Отправить')) {
-    submit.disabled = !ready;
-  }
 }
 
 function submitCombo() {
@@ -862,9 +858,7 @@ function updateSettingsButton() {
 // ============================================================
 
 function render() {
-  // Таймер обновим асинхронно — после того, как внутренний рендер установит DOM
   queueMicrotask(updateTimerUI);
-
   updateSettingsButton();
 
   if (!S.connected) {
@@ -912,12 +906,10 @@ function render() {
   }
 }
 
-// Возвращает только пустой слот. Наполняется через updateTimerUI().
 function timerBadge() {
   return `<div id="timer-slot" class="timer-slot"></div>`;
 }
 
-// --- Плеер-«walkman» ---
 function deckFront(memes, { playing = false, clickable = false, onClickJs = '', playBtnJs = '', playBtnInner = null } = {}) {
   const tapeLines = (memes ?? []).map(m => `<div class="tape-line">${escapeHtml(m.title)}</div>`).join('');
   const playInner = playBtnInner !== null ? playBtnInner : (playing ? '⏸' : '▶');

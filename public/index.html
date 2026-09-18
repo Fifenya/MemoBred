@@ -13,13 +13,12 @@
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <link rel="apple-touch-icon" href="/favicon.svg" />
   <link rel="manifest" href="/manifest.json" />
-  <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/style.css?v=3" />
 </head>
 <body>
   <div id="bg-glow" aria-hidden="true"></div>
   <div id="app"></div>
 
-  <!-- Плавающая кнопка настроек -->
   <button id="settings-btn" class="settings-btn" aria-label="Настройки" hidden>
     <svg viewBox="0 0 24 24" width="22" height="22" fill="none"
          stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -28,7 +27,6 @@
     </svg>
   </button>
 
-  <!-- Модальное окно настроек -->
   <div id="settings-modal" class="modal" hidden>
     <div class="modal-backdrop"></div>
     <div class="modal-panel">
@@ -54,9 +52,7 @@
 
         <div class="setting-row setting-track">
           <label>Трек</label>
-          <div class="track-grid" id="ambient-track-grid">
-            <!-- заполняется из JS -->
-          </div>
+          <div class="track-grid" id="ambient-track-grid"></div>
         </div>
 
         <div class="setting-row setting-slider">
@@ -78,6 +74,6 @@
   </div>
 
   <script src="/socket.io/socket.io.js"></script>
-  <script src="/app.js"></script>
+  <script src="/app.js?v=3"></script>
 </body>
 </html>

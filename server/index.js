@@ -40,11 +40,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR   = path.join(__dirname, '..');
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const MEMES_DIR  = path.join(ROOT_DIR, 'memes');
+const SOUNDS_DIR = path.join(PUBLIC_DIR, 'sounds');
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 
 fs.mkdirSync(MEMES_DIR, { recursive: true });
+fs.mkdirSync(SOUNDS_DIR, { recursive: true });
 seedIfEmpty();
 reloadPools();
 
@@ -54,10 +56,29 @@ reloadPools();
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
-app.use(express.static(PUBLIC_DIR, { extensions: ['html'], maxAge: '1h' }));
+
+// HTML / CSS / JS — без кэша, правки применяются сразу
+app.use(express.static(PUBLIC_DIR, {
+  extensions: ['html'],
+  etag: false,
+  lastModified: false,
+  setHeaders: (res, filePath) => {
+    if (/\.(html|css|js)$/i.test(filePath)) {
+      res.setHeader('Cache-Control', 'no-store, must-revalidate');
+    }
+  },
+}));
+
+// Мемы — кэш неделя (не меняются)
 app.use('/memes', express.static(MEMES_DIR, {
   maxAge: '7d',
   setHeaders: (res) => res.setHeader('Cache-Control', 'public, max-age=604800'),
+}));
+
+// Эмбиент-треки — кэш день
+app.use('/sounds', express.static(SOUNDS_DIR, {
+  maxAge: '1d',
+  setHeaders: (res) => res.setHeader('Cache-Control', 'public, max-age=86400'),
 }));
 
 // ============================================================
@@ -136,16 +157,10 @@ const io = new SocketServer(httpServer, {
 // Помощники
 // ============================================================
 
-/**
- * Достаёт пользователя из socket.data.user или null.
- */
 function currentUser(socket) {
   return socket.data?.user ?? null;
 }
 
-/**
- * Публичное представление юзера для клиента.
- */
 function publicUser(u) {
   if (!u) return null;
   return {
